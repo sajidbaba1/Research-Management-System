@@ -2,6 +2,7 @@ import React from 'react';
 import { BrowserRouter as Router, Route, Routes, Link } from 'react-router-dom';
 import ProjectList from './components/ProjectList';
 import ProjectTimeline3D from './components/ProjectTimeline3D';
+import AnalyticsDashboard from './components/AnalyticsDashboard';
 
 const App: React.FC = () => {
     return (
@@ -11,11 +12,13 @@ const App: React.FC = () => {
                     <ul className="flex space-x-4 text-white">
                         <li><Link to="/">Project List</Link></li>
                         <li><Link to="/timeline">3D Timeline</Link></li>
+                        <li><Link to="/analytics">Analytics</Link></li>
                     </ul>
                 </nav>
                 <Routes>
                     <Route path="/" element={<ProjectList />} />
                     <Route path="/timeline" element={<ProjectTimeline3D />} />
+                    <Route path="/analytics" element={<AnalyticsDashboard />} />
                 </Routes>
             </div>
         </Router>

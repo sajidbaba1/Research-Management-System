@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import axios from 'axios';
 
 interface TeamMember {
-    id: number;
+    id?: number;
     name: string;
     email: string;
     role: string;
@@ -19,7 +19,7 @@ interface ResearchProject {
 const TeamManagement: React.FC = () => {
     const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
     const [projects, setProjects] = useState<ResearchProject[]>([]);
-    const [selectedProject, setSelectedProject] = useState<number>('');
+    const [selectedProject, setSelectedProject] = useState<number | string>('');
     const [newMember, setNewMember] = useState<TeamMember>({
         name: '',
         email: '',
@@ -70,7 +70,11 @@ const TeamManagement: React.FC = () => {
         }
     };
 
-    const handleDelete = async (id: number) => {
+    const handleDelete = async (id?: number) => {
+        if (id === undefined) {
+            console.error('No team member ID provided for deletion');
+            return;
+        }
         try {
             await axios.delete(`http://localhost:8080/api/team-members/${id}`);
             fetchTeamMembers();

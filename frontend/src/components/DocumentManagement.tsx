@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import axios from 'axios';
 
 interface ProjectDocument {
-    id: number;
+    id?: number;
     fileName: string;
     fileType: string;
     filePath: string;
@@ -20,7 +20,7 @@ interface ResearchProject {
 const DocumentManagement: React.FC = () => {
     const [documents, setDocuments] = useState<ProjectDocument[]>([]);
     const [projects, setProjects] = useState<ResearchProject[]>([]);
-    const [selectedProject, setSelectedProject] = useState<number>('');
+    const [selectedProject, setSelectedProject] = useState<number | ''>('');
     const [newDocument, setNewDocument] = useState<ProjectDocument>({
         fileName: '',
         fileType: '',
@@ -73,7 +73,11 @@ const DocumentManagement: React.FC = () => {
         }
     };
 
-    const handleDelete = async (id: number) => {
+    const handleDelete = async (id?: number) => {
+        if (id === undefined) {
+            console.error('No document ID provided for deletion');
+            return;
+        }
         try {
             await axios.delete(`http://localhost:8080/api/documents/${id}`);
             fetchDocuments();
@@ -220,7 +224,7 @@ const DocumentManagement: React.FC = () => {
                                             Download
                                         </button>
                                         <button
-                                            onClick={() => handleDelete(document.id)}
+                                            onClick={() => handleDelete(document.id!)}
                                             className="text-red-600 hover:text-red-900"
                                         >
                                             Delete

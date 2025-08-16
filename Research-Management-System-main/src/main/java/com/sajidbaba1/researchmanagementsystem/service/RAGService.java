@@ -24,6 +24,8 @@ import java.util.stream.Collectors;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.nio.charset.StandardCharsets;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Service
 public class RAGService {
@@ -89,6 +91,9 @@ public class RAGService {
         private List<String> sources;
         private String query;
         private List<Map<String, Object>> citations;
+        private Double confidence; // 0..1
+        private Boolean abstained; // true when low confidence
+        private Double citationHealth; // 0..1
 
         public AIResponse(String answer, List<String> sources, String query) {
             this.answer = answer;
@@ -104,6 +109,63 @@ public class RAGService {
         public void setQuery(String query) { this.query = query; }
         public List<Map<String, Object>> getCitations() { return citations; }
         public void setCitations(List<Map<String, Object>> citations) { this.citations = citations; }
+        public Double getConfidence() { return confidence; }
+        public void setConfidence(Double confidence) { this.confidence = confidence; }
+        public Boolean getAbstained() { return abstained; }
+        public void setAbstained(Boolean abstained) { this.abstained = abstained; }
+        public Double getCitationHealth() { return citationHealth; }
+        public void setCitationHealth(Double citationHealth) { this.citationHealth = citationHealth; }
+    }
+
+    // Simple retry helper with exponential backoff
+    private <T> ResponseEntity<T> postWithRetry(String url, HttpEntity<?> entity, Class<T> responseType, int maxRetries, long baseBackoffMs) {
+        int attempt = 0;
+        RuntimeException lastEx = null;
+        while (attempt <= maxRetries) {
+            try {
+                return restTemplate.postForEntity(url, entity, responseType);
+            } catch (RuntimeException ex) {
+                lastEx = ex;
+                try { Thread.sleep(baseBackoffMs * (1L << attempt)); } catch (InterruptedException ignored) {}
+                attempt++;
+            }
+        }
+        if (lastEx != null) throw lastEx;
+        return null;
+    }
+
+    // Heuristic confidence score from retrieved matches and chunk coverage
+    private double computeConfidence(List<Map<String, Object>> matches, List<String> topChunks) {
+        int k = matches != null ? Math.min(10, matches.size()) : 0;
+        double recallFactor = k / 10.0; // 0..1 by how many we got
+        double lenAvg = 0.0;
+        if (topChunks != null && !topChunks.isEmpty()) {
+            for (String s : topChunks) lenAvg += (s != null ? s.length() : 0);
+            lenAvg /= topChunks.size();
+        }
+        double coverage = Math.min(1.0, lenAvg / 800.0);
+        return Math.max(0.0, Math.min(1.0, 0.2 + 0.6 * recallFactor + 0.2 * coverage));
+    }
+
+    private double computeCitationHealth(List<String> topChunks) {
+        if (topChunks == null || topChunks.isEmpty()) return 0.0;
+        double avgLen = 0.0;
+        for (String s : topChunks) avgLen += (s != null ? s.length() : 0);
+        avgLen /= topChunks.size();
+        return Math.max(0.0, Math.min(1.0, (topChunks.size() / 3.0) * 0.5 + Math.min(1.0, avgLen / 1000.0) * 0.5));
+    }
+
+    // Lightweight PII redaction for emails and phone-like patterns
+    private String redactPII(String text) {
+        if (text == null) return null;
+        String out = text;
+        Pattern email = Pattern.compile("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}");
+        Matcher m = email.matcher(out);
+        out = m.replaceAll("[redacted-email]");
+        Pattern phone = Pattern.compile("(?:(?:\\+?\\d{1,3}[ -]?)?(?:\\(\\d{2,4}\\)|\\d{2,4})[ -]?){2,4}\\d{3,4}");
+        m = phone.matcher(out);
+        out = m.replaceAll("[redacted-phone]");
+        return out;
     }
 
     public AIResponse searchAndAnswer(String query, Long projectId) {
@@ -143,15 +205,14 @@ public class RAGService {
                     uniq.putIfAbsent(id, m);
                 }
                 List<Map<String, Object>> matches = new ArrayList<>(uniq.values());
-                if (!matches.isEmpty()) {
+                if (matches != null && !matches.isEmpty()) {
                     try {
                         matches = rerankWithGemini(query, matches, 10);
                     } catch (Exception re) {
                         // If rerank fails, fallback to first 10
                         if (matches.size() > 10) matches = matches.subList(0, 10);
                     }
-                }
-                if (matches != null && !matches.isEmpty()) {
+
                     // Build a concise answer using Gemini 1.5 Flash on the top chunks
                     int k = Math.min(3, matches.size());
                     List<String> topChunks = new ArrayList<>();
@@ -174,11 +235,30 @@ public class RAGService {
                         citations.add(cite);
                     }
 
+                    double conf = computeConfidence(matches, topChunks);
+                    double citeHealth = computeCitationHealth(topChunks);
+                    if (conf < 0.35) {
+                        AIResponse ai = new AIResponse(
+                                "I’m not confident enough to answer this precisely. Please refine your question or narrow the scope.",
+                                sources,
+                                query
+                        );
+                        ai.setCitations(citations);
+                        ai.setConfidence(conf);
+                        ai.setCitationHealth(citeHealth);
+                        ai.setAbstained(true);
+                        return ai;
+                    }
+
                     try {
                         String nice = generateAnswerFromChunks(query, topChunks);
+                        nice = redactPII(nice);
                         if (nice != null && !nice.isBlank()) {
                             AIResponse ai = new AIResponse(nice, sources, query);
                             ai.setCitations(citations);
+                            ai.setConfidence(conf);
+                            ai.setCitationHealth(citeHealth);
+                            ai.setAbstained(false);
                             return ai;
                         }
                     } catch (Exception ge) {
@@ -280,7 +360,7 @@ public class RAGService {
         headers.setContentType(MediaType.APPLICATION_JSON);
         HttpEntity<Map<String, Object>> entity = new HttpEntity<>(payload, headers);
 
-        ResponseEntity<Map> resp = restTemplate.postForEntity(url, entity, Map.class);
+        ResponseEntity<Map> resp = postWithRetry(url, entity, Map.class, 2, 300);
         if (!resp.getStatusCode().is2xxSuccessful() || resp.getBody() == null) {
             throw new RuntimeException("Gemini generateContent failed: " + resp.getStatusCode());
         }
@@ -329,7 +409,7 @@ public class RAGService {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
         HttpEntity<Map<String, Object>> entity = new HttpEntity<>(payload, headers);
-        ResponseEntity<Map> resp = restTemplate.postForEntity(url, entity, Map.class);
+        ResponseEntity<Map> resp = postWithRetry(url, entity, Map.class, 2, 300);
         if (!resp.getStatusCode().is2xxSuccessful() || resp.getBody() == null) return Collections.emptyList();
         Map body = resp.getBody();
         Object candsObj = body.get("candidates");
@@ -391,7 +471,7 @@ public class RAGService {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
         HttpEntity<Map<String, Object>> entity = new HttpEntity<>(payload, headers);
-        ResponseEntity<Map> resp = restTemplate.postForEntity(url, entity, Map.class);
+        ResponseEntity<Map> resp = postWithRetry(url, entity, Map.class, 2, 300);
         if (!resp.getStatusCode().is2xxSuccessful() || resp.getBody() == null) return candidates;
         Object candsObj = resp.getBody().get("candidates");
         if (!(candsObj instanceof List) || ((List) candsObj).isEmpty()) return candidates;
@@ -582,7 +662,7 @@ public class RAGService {
             headers.setContentType(MediaType.APPLICATION_JSON);
             HttpEntity<Map<String, Object>> entity = new HttpEntity<>(payload, headers);
 
-            ResponseEntity<Map> resp = restTemplate.postForEntity(url, entity, Map.class);
+            ResponseEntity<Map> resp = postWithRetry(url, entity, Map.class, 2, 300);
             if (!resp.getStatusCode().is2xxSuccessful() || resp.getBody() == null) {
                 throw new RuntimeException("Gemini embedding failed: " + resp.getStatusCode());
             }
@@ -656,7 +736,7 @@ public class RAGService {
         headers.set("Api-Key", pineconeApiKey);
 
         HttpEntity<Map<String, Object>> entity = new HttpEntity<>(payload, headers);
-        ResponseEntity<Map> resp = restTemplate.postForEntity(url, entity, Map.class);
+        ResponseEntity<Map> resp = postWithRetry(url, entity, Map.class, 2, 300);
         if (!resp.getStatusCode().is2xxSuccessful() || resp.getBody() == null) {
             throw new RuntimeException("Pinecone query failed: " + resp.getStatusCode());
         }
@@ -701,7 +781,7 @@ public class RAGService {
         headers.set("Api-Key", pineconeApiKey);
 
         HttpEntity<Map<String, Object>> entity = new HttpEntity<>(payload, headers);
-        ResponseEntity<Map> resp = restTemplate.postForEntity(url, entity, Map.class);
+        ResponseEntity<Map> resp = postWithRetry(url, entity, Map.class, 2, 300);
         if (!resp.getStatusCode().is2xxSuccessful()) {
             throw new RuntimeException("Pinecone upsert failed: " + resp.getStatusCode());
         }

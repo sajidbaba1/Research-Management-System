@@ -39,9 +39,22 @@ export const SearchBar: React.FC<SearchBarProps> = ({
 
       setIsLoading(true);
       try {
+        const apiBase = process.env.REACT_APP_API_URL || 'http://localhost:8080';
         const response = await fetch(
-          `http://localhost:8080/api/search/suggestions?query=${encodeURIComponent(searchQuery)}`
+          `${apiBase}/api/search/suggestions?query=${encodeURIComponent(searchQuery)}`,
+          { headers: { 'Accept': 'application/json' } }
         );
+        if (!response.ok) {
+          // Don't throw for suggestions; just log and clear
+          console.warn('Suggestion fetch failed', response.status);
+          setSuggestions([]);
+          return;
+        }
+        const contentType = response.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+          setSuggestions([]);
+          return;
+        }
         const data = await response.json();
         
         const formattedSuggestions = data.map((suggestion: string) => ({

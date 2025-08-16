@@ -52,12 +52,19 @@ const SearchResults: React.FC = () => {
         size: '20',
         ...(searchFilters || {})
       });
-
-      const response = await fetch(`/api/search?${params}`);
+      const apiBase = process.env.REACT_APP_API_URL || '';
+      const response = await fetch(`${apiBase}/api/search?${params.toString()}`, {
+        headers: { 'Accept': 'application/json' }
+      });
       if (!response.ok) {
-        throw new Error('Search failed');
+        const text = await response.text();
+        throw new Error(`Search failed (${response.status}). ${text.substring(0, 160)}`);
       }
-
+      const contentType = response.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        const text = await response.text();
+        throw new Error(`Unexpected response from backend (expected JSON). Is the API running at ${apiBase}? Received: ${text.substring(0, 160)}`);
+      }
       const data = await response.json();
       setSearchResults(data);
     } catch (err) {

@@ -30,6 +30,8 @@ const RAGChat: React.FC = () => {
     const [projectInsights, setProjectInsights] = useState<any>(null);
     const [isTyping, setIsTyping] = useState(false);
     const [selectedDocumentId, setSelectedDocumentId] = useState<number | ''>('');
+    const [isRecording, setIsRecording] = useState(false);
+    const recognitionRef = useRef<any>(null);
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
@@ -111,6 +113,53 @@ const RAGChat: React.FC = () => {
         setMessages([]);
         fetchProjectInsights(projectId);
         setSelectedDocumentId('');
+    };
+
+    // Initialize Web Speech API lazily
+    const initRecognition = () => {
+        if (recognitionRef.current) return recognitionRef.current;
+        const SpeechRecognition: any = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+            alert('Speech recognition is not supported in this browser. Try Chrome.');
+            return null;
+        }
+        const rec = new SpeechRecognition();
+        rec.continuous = true;
+        rec.interimResults = true;
+        rec.lang = 'en-US';
+
+        rec.onresult = (event: any) => {
+            let interim = '';
+            let final = '';
+            for (let i = event.resultIndex; i < event.results.length; i++) {
+                const transcript = event.results[i][0].transcript;
+                if (event.results[i].isFinal) final += transcript;
+                else interim += transcript;
+            }
+            setInputMessage(prev => final ? final : (interim || prev));
+        };
+        rec.onend = () => {
+            setIsRecording(false);
+        };
+        recognitionRef.current = rec;
+        return rec;
+    };
+
+    const toggleRecording = () => {
+        const rec = initRecognition();
+        if (!rec) return;
+        if (isRecording) {
+            rec.stop();
+            setIsRecording(false);
+        } else {
+            try {
+                rec.start();
+                setIsRecording(true);
+            } catch (e) {
+                // start can throw if already started
+                console.warn('Speech start warning:', e);
+            }
+        }
     };
 
     const handleIndexDocument = async () => {
@@ -286,6 +335,15 @@ const RAGChat: React.FC = () => {
                                         disabled={!selectedProject || isLoading}
                                         className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
                                     />
+                                    <button
+                                        type="button"
+                                        onClick={toggleRecording}
+                                        disabled={!selectedProject}
+                                        title={isRecording ? 'Stop recording' : 'Start voice input'}
+                                        className={`px-3 py-2 rounded-lg border ${isRecording ? 'bg-red-100 border-red-400 text-red-700' : 'bg-gray-100 border-gray-300 text-gray-700'}`}
+                                    >
+                                        {isRecording ? '● Rec' : '🎤'}
+                                    </button>
                                     <button
                                         onClick={handleSendMessage}
                                         disabled={!inputMessage.trim() || !selectedProject || isLoading}

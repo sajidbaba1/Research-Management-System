@@ -13,6 +13,11 @@ import org.springframework.http.*;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
+import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.text.PDFTextStripper;
+import java.io.File;
+
 import jakarta.annotation.PostConstruct;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -113,15 +118,33 @@ public class RAGService {
                 float[] q748 = resizeVectors(Collections.singletonList(qVec), 748).get(0);
                 List<Map<String, Object>> matches = queryPinecone(q748, projectId, documentId, 5);
                 if (matches != null && !matches.isEmpty()) {
-                    responseBuilder.append("Top semantic matches from project documents:\n");
+                    // Build a concise answer using Gemini 1.5 Flash on the top chunks
                     int k = Math.min(3, matches.size());
+                    List<String> topChunks = new ArrayList<>();
                     for (int i = 0; i < k; i++) {
                         Map<String, Object> m = matches.get(i);
                         Map<String, Object> meta = (Map<String, Object>) m.get("metadata");
                         String fileName = meta != null && meta.get("fileName") != null ? meta.get("fileName").toString() : "document";
                         String chunk = meta != null && meta.get("chunk") != null ? meta.get("chunk").toString() : "";
-                        responseBuilder.append("- ").append(fileName).append(": ").append(chunk).append("\n\n");
-                        sources.add(fileName);
+                        // Truncate overly long chunks for prompt efficiency
+                        if (chunk.length() > 1200) chunk = chunk.substring(0, 1200);
+                        topChunks.add("[" + (i+1) + "] " + fileName + "\n" + chunk);
+                        if (!sources.contains(fileName)) sources.add(fileName);
+                    }
+
+                    try {
+                        String nice = generateAnswerFromChunks(query, topChunks);
+                        if (nice != null && !nice.isBlank()) {
+                            return new AIResponse(nice, sources, query);
+                        }
+                    } catch (Exception ge) {
+                        System.err.println("Gemini synthesis failed: " + ge.getMessage());
+                    }
+
+                    // Fallback to listing matches (formatted)
+                    responseBuilder.append("## Top semantic matches\n\n");
+                    for (int i = 0; i < topChunks.size(); i++) {
+                        responseBuilder.append("- ").append(topChunks.get(i)).append("\n\n");
                     }
                     return new AIResponse(responseBuilder.toString(), sources, query);
                 }
@@ -179,6 +202,66 @@ public class RAGService {
         } catch (Exception e) {
             return new AIResponse("Error processing query: " + e.getMessage(), Collections.emptyList(), query);
         }
+    }
+
+    // Compose a clean, readable markdown answer using Gemini 1.5 Flash
+    private String generateAnswerFromChunks(String query, List<String> topChunks) throws Exception {
+        if (geminiApiKey == null || geminiApiKey.isBlank()) return null;
+        String model = "gemini-1.5-flash";
+        String url = "https://generativelanguage.googleapis.com/v1/models/" + model + ":generateContent?key=" + geminiApiKey;
+
+        // Build a compact, formatting-oriented prompt
+        StringBuilder prompt = new StringBuilder();
+        prompt.append("You are a helpful assistant answering questions from provided document excerpts.\n");
+        prompt.append("- Answer the user query concisely.\n");
+        prompt.append("- Use markdown with short headings and bullet points.\n");
+        prompt.append("- Cite sources as [1], [2], etc., matching the chunk indices.\n");
+        prompt.append("- If unsure, say so.\n\n");
+        prompt.append("User question: \n" + query + "\n\n");
+        prompt.append("Context chunks:\n");
+        for (int i = 0; i < topChunks.size(); i++) {
+            prompt.append(topChunks.get(i)).append("\n\n");
+        }
+
+        Map<String, Object> part = new HashMap<>();
+        part.put("text", prompt.toString());
+        Map<String, Object> content = new HashMap<>();
+        content.put("role", "user");
+        content.put("parts", Collections.singletonList(part));
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("contents", Collections.singletonList(content));
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<Map<String, Object>> entity = new HttpEntity<>(payload, headers);
+
+        ResponseEntity<Map> resp = restTemplate.postForEntity(url, entity, Map.class);
+        if (!resp.getStatusCode().is2xxSuccessful() || resp.getBody() == null) {
+            throw new RuntimeException("Gemini generateContent failed: " + resp.getStatusCode());
+        }
+
+        Map body = resp.getBody();
+        Object candsObj = body.get("candidates");
+        if (!(candsObj instanceof List)) return null;
+        List cands = (List) candsObj;
+        if (cands.isEmpty()) return null;
+        Object first = cands.get(0);
+        if (!(first instanceof Map)) return null;
+        Map firstMap = (Map) first;
+        Object cObj = firstMap.get("content");
+        if (!(cObj instanceof Map)) return null;
+        Map cMap = (Map) cObj;
+        Object partsObj = cMap.get("parts");
+        if (!(partsObj instanceof List)) return null;
+        List partsList = (List) partsObj;
+        StringBuilder out = new StringBuilder();
+        for (Object p : partsList) {
+            if (p instanceof Map) {
+                Object t = ((Map) p).get("text");
+                if (t != null) out.append(t.toString());
+            }
+        }
+        return out.toString().trim();
     }
 
     public Map<String, Object> getProjectInsights(Long projectId) {
@@ -247,7 +330,8 @@ public class RAGService {
                 text = document.getFileName() != null ? document.getFileName() : ("doc-" + document.getId());
             }
 
-            List<String> chunks = chunk(text, 1000);
+            // Use overlap chunking for better context retention across chunks
+            List<String> chunks = chunkWithOverlap(text, 1000, 200);
             List<float[]> vectors = embedWithGemini(chunks);
             // Truncate or pad to 748 dims to match index
             List<float[]> resized = resizeVectors(vectors, 748);
@@ -263,11 +347,23 @@ public class RAGService {
     }
 
     private String extractText(ProjectDocument doc) throws Exception {
-        // Naive read as UTF-8 text. For PDFs/Docs, integrate a parser (e.g., PDFBox) if needed.
+        // Robust text extraction: PDF via PDFBox, plain text for .txt, fallback to empty
+        if (doc == null || doc.getFilePath() == null) return "";
+        String path = doc.getFilePath();
+        String lower = path.toLowerCase();
         try {
-            return Files.readString(Paths.get(doc.getFilePath()), StandardCharsets.UTF_8);
+            if (lower.endsWith(".pdf")) {
+                try (PDDocument pdf = Loader.loadPDF(new File(path))) {
+                    PDFTextStripper stripper = new PDFTextStripper();
+                    String txt = stripper.getText(pdf);
+                    return txt != null ? txt.trim() : "";
+                }
+            } else {
+                // Treat as UTF-8 text file
+                return Files.readString(Paths.get(path), StandardCharsets.UTF_8);
+            }
         } catch (Exception e) {
-            // Fallback: return empty to avoid crashing
+            // Fallback: return empty to avoid crashing indexing pipeline
             return "";
         }
     }
@@ -284,16 +380,49 @@ public class RAGService {
         return chunks;
     }
 
+    // New: chunking with overlap to preserve context between adjacent chunks
+    private List<String> chunkWithOverlap(String text, int size, int overlap) {
+        List<String> chunks = new ArrayList<>();
+        if (text == null || text.isEmpty()) return chunks;
+        if (size <= 0) size = 1000;
+        if (overlap < 0) overlap = 0;
+        if (overlap >= size) overlap = size / 4; // safety
+
+        int start = 0;
+        while (start < text.length()) {
+            int end = Math.min(text.length(), start + size);
+            String piece = text.substring(start, end);
+            chunks.add(piece);
+            if (end >= text.length()) break;
+            start = end - overlap;
+            if (start < 0) start = 0;
+        }
+        return chunks;
+    }
+
     private List<float[]> embedWithGemini(List<String> chunks) throws Exception {
         if (geminiApiKey == null || geminiApiKey.isBlank()) {
             throw new RuntimeException("Gemini API key not configured");
         }
-        String url = "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedText?key=" + geminiApiKey;
+        String url = "https://generativelanguage.googleapis.com/v1/models/text-embedding-004:embedContent?key=" + geminiApiKey;
 
         List<float[]> vectors = new ArrayList<>();
         for (String chunk : chunks) {
+            // Build payload per v1 embedContent schema:
+            // {
+            //   "content": { "parts": [ { "text": "..." } ] }
+            // }
+            Map<String, Object> textPart = new HashMap<>();
+            textPart.put("text", chunk);
+
+            List<Map<String, Object>> parts = new ArrayList<>();
+            parts.add(textPart);
+
+            Map<String, Object> content = new HashMap<>();
+            content.put("parts", parts);
+
             Map<String, Object> payload = new HashMap<>();
-            payload.put("text", chunk);
+            payload.put("content", content);
 
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);

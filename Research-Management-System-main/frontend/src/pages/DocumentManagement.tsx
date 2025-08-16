@@ -24,9 +24,12 @@ const DocumentManagement: React.FC = () => {
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadStatus, setUploadStatus] = useState<'idle' | 'uploading' | 'success' | 'error'>('idle');
+  const [projects, setProjects] = useState<any[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState<number | ''>('');
 
   useEffect(() => {
     fetchDocuments();
+    fetchProjects();
   }, []);
 
   const fetchDocuments = async () => {
@@ -34,7 +37,24 @@ const DocumentManagement: React.FC = () => {
     try {
       const response = await fetch('http://localhost:8080/api/documents');
       const data = await response.json();
-      setDocuments(data);
+      const normalized: Document[] = (Array.isArray(data) ? data : []).map((d: any) => ({
+        id: d.id,
+        name: d.name ?? d.fileName ?? 'Untitled',
+        type: d.type ?? d.fileType ?? 'UNKNOWN',
+        size: typeof d.size === 'number' ? d.size : (typeof d.fileSize === 'number' ? d.fileSize : 0),
+        uploadDate: d.uploadDate ?? d.createdAt ?? d.created_on ?? '',
+        lastModified: d.lastModified ?? d.updatedAt ?? d.updated_on ?? '',
+        version: typeof d.version === 'number' ? d.version : 1,
+        projectId: d.projectId ?? d.project_id ?? 0,
+        uploadedBy: d.uploadedBy ?? d.uploader ?? 'Unknown',
+        status: d.status ?? 'ACTIVE',
+        description: d.description ?? ''
+      }))
+      .filter(doc => !(
+        ['Project proposal document', 'Research methodology'].includes(doc.name) ||
+        [9, 10].includes(doc.id)
+      ));
+      setDocuments(normalized);
     } catch (error) {
       console.error('Error fetching documents:', error);
       setDocuments([]);
@@ -44,7 +64,7 @@ const DocumentManagement: React.FC = () => {
   };
 
   const handleFileUpload = async (file: File) => {
-    if (!file) return;
+    if (!file || !selectedProjectId) return;
 
     setUploadStatus('uploading');
     setUploadProgress(0);
@@ -52,7 +72,10 @@ const DocumentManagement: React.FC = () => {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('description', 'Uploaded document for RAG processing');
-    formData.append('uploadedBy', 'current-user');
+    formData.append('uploadedBy', '1');
+    formData.append('fileName', file.name);
+    formData.append('fileType', file.type || 'application/octet-stream');
+    formData.append('projectId', String(selectedProjectId));
 
     try {
       // Upload document
@@ -92,9 +115,9 @@ const DocumentManagement: React.FC = () => {
         },
         body: JSON.stringify({
           documentId: document.id,
-          fileName: document.name,
+          fileName: document.name ?? document.fileName,
           filePath: document.filePath,
-          fileType: document.type
+          fileType: document.type ?? document.fileType
         }),
       });
 
@@ -111,6 +134,37 @@ const DocumentManagement: React.FC = () => {
     if (file) {
       setUploadFile(file);
     }
+  };
+
+  const fetchProjects = async () => {
+    try {
+      const res = await fetch('http://localhost:8080/api/projects');
+      const data = await res.json();
+      const list = Array.isArray(data) ? data : [];
+      setProjects(list);
+      if (list.length > 0) {
+        setSelectedProjectId(list[0].id ?? list[0].projectId ?? '');
+      }
+    } catch (e) {
+      console.error('Failed to fetch projects', e);
+      setProjects([]);
+      setSelectedProjectId('');
+    }
+  };
+
+  const handleView = (doc: any) => {
+    const url = `http://localhost:8080/api/documents/download/${doc.id}`;
+    window.open(url, '_blank');
+  };
+
+  const handleDownload = (doc: any) => {
+    const url = `http://localhost:8080/api/documents/download/${doc.id}`;
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = (doc.name || doc.fileName || 'document');
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
   };
 
   const filteredDocuments = documents.filter(doc => 
@@ -182,16 +236,16 @@ const DocumentManagement: React.FC = () => {
                     <FileText className="h-8 w-8 text-blue-600" />
                     <div>
                       <h3 className="text-lg font-medium text-gray-900 dark:text-white truncate">{doc.name}</h3>
-                      <p className="text-sm text-gray-500 dark:text-gray-400">{doc.type} • {formatFileSize(doc.size)}</p>
+                      <p className="text-sm text-gray-500 dark:text-gray-400">{doc.type} • {formatFileSize(typeof doc.size === 'number' && isFinite(doc.size) ? doc.size : 0)}</p>
                     </div>
                   </div>
                   <span className={`px-2 py-1 text-xs font-medium rounded-full ${
-                    doc.status === 'APPROVED' ? 'bg-green-100 text-green-800' :
-                    doc.status === 'REVIEW' ? 'bg-yellow-100 text-yellow-800' :
-                    doc.status === 'DRAFT' ? 'bg-gray-100 text-gray-800' :
-                    'bg-red-100 text-red-800'
+                    (doc.status ?? 'ACTIVE') === 'APPROVED' ? 'bg-green-100 text-green-800' :
+                    (doc.status ?? 'ACTIVE') === 'REVIEW' ? 'bg-yellow-100 text-yellow-800' :
+                    (doc.status ?? 'ACTIVE') === 'DRAFT' ? 'bg-gray-100 text-gray-800' :
+                    'bg-blue-100 text-blue-800'
                   }`}>
-                    {doc.status}
+                    {doc.status ?? 'ACTIVE'}
                   </span>
                 </div>
                 
@@ -207,17 +261,17 @@ const DocumentManagement: React.FC = () => {
                     </span>
                     <span className="flex items-center">
                       <Calendar className="h-4 w-4 mr-1" />
-                      {doc.uploadDate}
+                      {doc.uploadDate ? doc.uploadDate : '-'}
                     </span>
                   </div>
                 </div>
 
                 <div className="mt-4 flex space-x-2">
-                  <button className="flex-1 flex items-center justify-center px-3 py-2 border border-gray-300 dark:border-slate-600 text-gray-700 dark:text-gray-300 rounded-md hover:bg-gray-50 dark:hover:bg-slate-700">
+                  <button onClick={() => handleView(doc)} className="flex-1 flex items-center justify-center px-3 py-2 border border-gray-300 dark:border-slate-600 text-gray-700 dark:text-gray-300 rounded-md hover:bg-gray-50 dark:hover:bg-slate-700">
                     <Eye className="h-4 w-4 mr-1" />
                     View
                   </button>
-                  <button className="flex-1 flex items-center justify-center px-3 py-2 border border-gray-300 dark:border-slate-600 text-gray-700 dark:text-gray-300 rounded-md hover:bg-gray-50 dark:hover:bg-slate-700">
+                  <button onClick={() => handleDownload(doc)} className="flex-1 flex items-center justify-center px-3 py-2 border border-gray-300 dark:border-slate-600 text-gray-700 dark:text-gray-300 rounded-md hover:bg-gray-50 dark:hover:bg-slate-700">
                     <Download className="h-4 w-4 mr-1" />
                     Download
                   </button>
@@ -234,6 +288,23 @@ const DocumentManagement: React.FC = () => {
               <h2 className="text-xl font-bold text-gray-900 dark:text-white mb-4">Upload Document</h2>
               
               <div className="space-y-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                    Select Project
+                  </label>
+                  <select
+                    value={selectedProjectId}
+                    onChange={(e) => setSelectedProjectId(Number(e.target.value))}
+                    className="w-full border border-gray-300 dark:border-slate-600 rounded-lg px-3 py-2 focus:ring-2 focus:ring-blue-500 bg-white dark:bg-slate-800 text-gray-900 dark:text-white"
+                  >
+                    <option value="" disabled>Select a project</option>
+                    {projects.map((p) => (
+                      <option key={p.id ?? p.projectId} value={p.id ?? p.projectId}>
+                        {p.title ?? p.name ?? `Project ${p.id ?? p.projectId}`}
+                      </option>
+                    ))}
+                  </select>
+                </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
                     Select File
@@ -279,7 +350,7 @@ const DocumentManagement: React.FC = () => {
                 </button>
                 <button
                   onClick={() => uploadFile && handleFileUpload(uploadFile)}
-                  disabled={!uploadFile || uploadStatus === 'uploading'}
+                  disabled={!uploadFile || !selectedProjectId || uploadStatus === 'uploading'}
                   className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {uploadStatus === 'uploading' ? 'Uploading...' : 'Upload'}

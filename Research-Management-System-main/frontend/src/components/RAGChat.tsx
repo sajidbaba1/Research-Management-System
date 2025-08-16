@@ -29,6 +29,7 @@ const RAGChat: React.FC = () => {
     const [isLoading, setIsLoading] = useState(false);
     const [projectInsights, setProjectInsights] = useState<any>(null);
     const [isTyping, setIsTyping] = useState(false);
+    const [selectedDocumentId, setSelectedDocumentId] = useState<number | ''>('');
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
@@ -76,7 +77,8 @@ const RAGChat: React.FC = () => {
             const response = await axios.post('http://localhost:8080/api/rag/search', null, {
                 params: {
                     query: inputMessage,
-                    projectId: selectedProject
+                    projectId: selectedProject,
+                    documentId: selectedDocumentId || undefined
                 }
             });
 
@@ -108,6 +110,30 @@ const RAGChat: React.FC = () => {
         setSelectedProject(projectId);
         setMessages([]);
         fetchProjectInsights(projectId);
+        setSelectedDocumentId('');
+    };
+
+    const handleIndexDocument = async () => {
+        if (!selectedProject || !selectedDocumentId) return;
+        try {
+            const res = await axios.post('http://localhost:8080/api/rag/index-document', null, {
+                params: { documentId: selectedDocumentId }
+            });
+            // Refresh insights to reflect processed status
+            await fetchProjectInsights(selectedProject as number);
+            if (res.data && res.data.success) {
+                alert('Document indexed successfully.');
+            } else {
+                const msg = res.data?.message || res.data?.error || 'Unknown error';
+                alert(`Failed to index document: ${msg}`);
+            }
+        } catch (err) {
+            console.error('Indexing failed', err);
+            // Try to surface backend error message if available
+            const anyErr: any = err as any;
+            const serverMsg = anyErr?.response?.data?.message || anyErr?.response?.data?.error;
+            alert(`Failed to index document: ${serverMsg || 'Network/server error'}`);
+        }
     };
 
     const formatTimestamp = (date: Date) => {
@@ -148,7 +174,7 @@ const RAGChat: React.FC = () => {
                                 <div className="mt-6 space-y-4">
                                     <h3 className="text-md font-semibold text-gray-700">Project Insights</h3>
                                     <div className="space-y-2 text-sm">
-                                        <p><span className="font-medium">Documents:</span> {projectInsights.totalDocuments}</p>
+                                        <p><span className="font-medium">Documents:</span> {projectInsights.totalDocuments ?? projectInsights.documentCount ?? 0}</p>
                                         <div>
                                             <p className="font-medium">Document Types:</p>
                                             {Object.entries(projectInsights.documentTypes || {}).map(([type, count]) => (
@@ -158,6 +184,29 @@ const RAGChat: React.FC = () => {
                                                     </p>
                                                 </React.Fragment>
                                             ))}
+                                        </div>
+                                        {/* Document selection for indexing */}
+                                        <div className="mt-4">
+                                            <p className="font-medium mb-2">Select document to index</p>
+                                            <select
+                                                value={selectedDocumentId}
+                                                onChange={(e) => setSelectedDocumentId(Number(e.target.value))}
+                                                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                            >
+                                                <option value="">Select a document</option>
+                                                {(projectInsights.documents || []).map((d: any) => (
+                                                    <option key={d.id} value={d.id}>
+                                                        {d.fileName || d.name || `Document ${d.id}`}
+                                                    </option>
+                                                ))}
+                                            </select>
+                                            <button
+                                                onClick={handleIndexDocument}
+                                                disabled={!selectedDocumentId}
+                                                className="mt-3 px-4 py-2 bg-green-600 text-white rounded-lg disabled:opacity-50"
+                                            >
+                                                Index Document
+                                            </button>
                                         </div>
                                     </div>
                                 </div>

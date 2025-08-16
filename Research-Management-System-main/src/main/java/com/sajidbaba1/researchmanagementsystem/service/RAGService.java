@@ -16,6 +16,9 @@ import org.springframework.web.client.RestTemplate;
 import jakarta.annotation.PostConstruct;
 import java.util.*;
 import java.util.stream.Collectors;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.nio.charset.StandardCharsets;
 
 @Service
 public class RAGService {
@@ -28,6 +31,15 @@ public class RAGService {
     
     @Value("${pinecone.api.key:}")
     private String pineconeApiKey;
+
+    @Value("${pinecone.index.name:}")
+    private String pineconeIndexName;
+
+    @Value("${pinecone.host:}")
+    private String pineconeHost;
+
+    @Value("${gemini.api.key:}")
+    private String geminiApiKey;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -87,9 +99,36 @@ public class RAGService {
     }
 
     public AIResponse searchAndAnswer(String query, Long projectId) {
+        return searchAndAnswer(query, projectId, null);
+    }
+
+    public AIResponse searchAndAnswer(String query, Long projectId, Long documentId) {
         try {
             StringBuilder responseBuilder = new StringBuilder();
             List<String> sources = new ArrayList<>();
+
+            // First try semantic search via Pinecone for the selected project namespace
+            try {
+                float[] qVec = embedQueryWithGemini(query);
+                float[] q748 = resizeVectors(Collections.singletonList(qVec), 748).get(0);
+                List<Map<String, Object>> matches = queryPinecone(q748, projectId, documentId, 5);
+                if (matches != null && !matches.isEmpty()) {
+                    responseBuilder.append("Top semantic matches from project documents:\n");
+                    int k = Math.min(3, matches.size());
+                    for (int i = 0; i < k; i++) {
+                        Map<String, Object> m = matches.get(i);
+                        Map<String, Object> meta = (Map<String, Object>) m.get("metadata");
+                        String fileName = meta != null && meta.get("fileName") != null ? meta.get("fileName").toString() : "document";
+                        String chunk = meta != null && meta.get("chunk") != null ? meta.get("chunk").toString() : "";
+                        responseBuilder.append("- ").append(fileName).append(": ").append(chunk).append("\n\n");
+                        sources.add(fileName);
+                    }
+                    return new AIResponse(responseBuilder.toString(), sources, query);
+                }
+            } catch (Exception e) {
+                // Fallback silently to keyword search if Pinecone/Gemini fails
+                System.err.println("Semantic search failed, falling back: " + e.getMessage());
+            }
 
             // Search projects
             List<ResearchProject> projects = projectRepository.findAll();
@@ -196,6 +235,192 @@ public class RAGService {
         } catch (Exception e) {
             System.err.println("Error processing document for RAG: " + e.getMessage());
             return false;
+        }
+    }
+
+    // ===== New: Full processing (extract -> embed via Gemini -> upsert to Pinecone) =====
+    public boolean processAndIndexDocument(ProjectDocument document) {
+        try {
+            String text = extractText(document);
+            if (text == null || text.isEmpty()) {
+                // fallback to filename to ensure at least one vector written
+                text = document.getFileName() != null ? document.getFileName() : ("doc-" + document.getId());
+            }
+
+            List<String> chunks = chunk(text, 1000);
+            List<float[]> vectors = embedWithGemini(chunks);
+            // Truncate or pad to 748 dims to match index
+            List<float[]> resized = resizeVectors(vectors, 748);
+            upsertToPinecone(document.getProjectId(), document.getId(), document.getFileName(), chunks, resized);
+
+            document.setStatus("PROCESSED");
+            documentRepository.save(document);
+            return true;
+        } catch (Exception e) {
+            System.err.println("Pinecone index error: " + e.getMessage());
+            return false;
+        }
+    }
+
+    private String extractText(ProjectDocument doc) throws Exception {
+        // Naive read as UTF-8 text. For PDFs/Docs, integrate a parser (e.g., PDFBox) if needed.
+        try {
+            return Files.readString(Paths.get(doc.getFilePath()), StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            // Fallback: return empty to avoid crashing
+            return "";
+        }
+    }
+
+    private List<String> chunk(String text, int size) {
+        List<String> chunks = new ArrayList<>();
+        if (text == null) return chunks;
+        int i = 0;
+        while (i < text.length()) {
+            int end = Math.min(text.length(), i + size);
+            chunks.add(text.substring(i, end));
+            i = end;
+        }
+        return chunks;
+    }
+
+    private List<float[]> embedWithGemini(List<String> chunks) throws Exception {
+        if (geminiApiKey == null || geminiApiKey.isBlank()) {
+            throw new RuntimeException("Gemini API key not configured");
+        }
+        String url = "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedText?key=" + geminiApiKey;
+
+        List<float[]> vectors = new ArrayList<>();
+        for (String chunk : chunks) {
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("text", chunk);
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            HttpEntity<Map<String, Object>> entity = new HttpEntity<>(payload, headers);
+
+            ResponseEntity<Map> resp = restTemplate.postForEntity(url, entity, Map.class);
+            if (!resp.getStatusCode().is2xxSuccessful() || resp.getBody() == null) {
+                throw new RuntimeException("Gemini embedding failed: " + resp.getStatusCode());
+            }
+            // Response shape: { embedding: { values: [..] } } (primary)
+            // or { embedding: { value: [..] } } (legacy) or { embeddings: [ { values: [] } ] }
+            Map body = resp.getBody();
+            List<Double> values = null;
+            if (body.get("embedding") instanceof Map) {
+                Map emb = (Map) body.get("embedding");
+                Object arrVals = emb.get("values");
+                Object arrVal = emb.get("value");
+                if (arrVals instanceof List) values = (List<Double>) arrVals;
+                else if (arrVal instanceof List) values = (List<Double>) arrVal;
+            } else if (body.get("embeddings") instanceof List) {
+                List list = (List) body.get("embeddings");
+                if (!list.isEmpty() && list.get(0) instanceof Map) {
+                    Map first = (Map) list.get(0);
+                    Object vals = first.get("values");
+                    if (vals instanceof List) values = (List<Double>) vals;
+                }
+            }
+            if (values == null) throw new RuntimeException("Unexpected Gemini embedding response");
+
+            float[] vector = new float[values.size()];
+            for (int i = 0; i < values.size(); i++) vector[i] = values.get(i).floatValue();
+            vectors.add(vector);
+        }
+        return vectors;
+    }
+
+    private List<float[]> resizeVectors(List<float[]> vectors, int targetDim) {
+        List<float[]> out = new ArrayList<>();
+        for (float[] v : vectors) {
+            float[] r = new float[targetDim];
+            int copy = Math.min(targetDim, v.length);
+            System.arraycopy(v, 0, r, 0, copy);
+            // remaining stay 0 if v shorter; if v longer, truncated
+            out.add(r);
+        }
+        return out;
+    }
+
+    private float[] embedQueryWithGemini(String text) throws Exception {
+        List<float[]> res = embedWithGemini(Collections.singletonList(text));
+        if (res.isEmpty()) throw new RuntimeException("Failed to embed query");
+        return res.get(0);
+    }
+
+    private List<Map<String, Object>> queryPinecone(float[] vector, Long projectId, Long documentId, int topK) throws Exception {
+        if (pineconeApiKey == null || pineconeApiKey.isBlank()) {
+            throw new RuntimeException("Pinecone API key not configured");
+        }
+        if (pineconeHost == null || pineconeHost.isBlank()) {
+            throw new RuntimeException("Pinecone host not configured");
+        }
+        String url = pineconeHost + "/query";
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("vector", vector);
+        payload.put("topK", topK);
+        payload.put("namespace", String.valueOf(projectId));
+        payload.put("includeMetadata", true);
+        if (documentId != null) {
+            Map<String, Object> filter = new HashMap<>();
+            filter.put("documentId", documentId);
+            payload.put("filter", filter);
+        }
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.set("Api-Key", pineconeApiKey);
+
+        HttpEntity<Map<String, Object>> entity = new HttpEntity<>(payload, headers);
+        ResponseEntity<Map> resp = restTemplate.postForEntity(url, entity, Map.class);
+        if (!resp.getStatusCode().is2xxSuccessful() || resp.getBody() == null) {
+            throw new RuntimeException("Pinecone query failed: " + resp.getStatusCode());
+        }
+        Object matches = resp.getBody().get("matches");
+        if (matches instanceof List) {
+            return (List<Map<String, Object>>) matches;
+        }
+        return Collections.emptyList();
+    }
+
+    private void upsertToPinecone(Long projectId, Long documentId, String fileName, List<String> chunks, List<float[]> vectors) {
+        if (pineconeApiKey == null || pineconeApiKey.isBlank()) {
+            throw new RuntimeException("Pinecone API key not configured");
+        }
+        if (pineconeHost == null || pineconeHost.isBlank()) {
+            throw new RuntimeException("Pinecone host not configured");
+        }
+
+        String url = pineconeHost + "/vectors/upsert";
+
+        List<Map<String, Object>> vecs = new ArrayList<>();
+        for (int i = 0; i < vectors.size(); i++) {
+            Map<String, Object> meta = new HashMap<>();
+            meta.put("projectId", projectId);
+            meta.put("documentId", documentId);
+            meta.put("fileName", fileName);
+            meta.put("chunk", chunks.get(i));
+
+            Map<String, Object> v = new HashMap<>();
+            v.put("id", documentId + ":" + i);
+            v.put("values", vectors.get(i));
+            v.put("metadata", meta);
+            vecs.add(v);
+        }
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("vectors", vecs);
+        payload.put("namespace", String.valueOf(projectId));
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.set("Api-Key", pineconeApiKey);
+
+        HttpEntity<Map<String, Object>> entity = new HttpEntity<>(payload, headers);
+        ResponseEntity<Map> resp = restTemplate.postForEntity(url, entity, Map.class);
+        if (!resp.getStatusCode().is2xxSuccessful()) {
+            throw new RuntimeException("Pinecone upsert failed: " + resp.getStatusCode());
         }
     }
 

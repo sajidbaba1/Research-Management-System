@@ -93,7 +93,7 @@ const Chatbot: React.FC = () => {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(context),
+        body: JSON.stringify({ question: messageText, voiceInput: false }),
       });
 
       const data = await response.json();

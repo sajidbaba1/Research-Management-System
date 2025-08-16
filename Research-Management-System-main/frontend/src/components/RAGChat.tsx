@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import ReactMarkdown from 'react-markdown';
 import axios from 'axios';
 
 interface ChatMessage {
@@ -287,12 +288,26 @@ const RAGChat: React.FC = () => {
                                 ) : (
                                     messages.map(message => (
                                         <div key={message.id} className={`flex ${message.type === 'user' ? 'justify-end' : 'justify-start'}`}>
-                                            <div className={`max-w-3xl ${message.type === 'user' ? 'bg-blue-500 text-white' : 'bg-gray-100'} rounded-2xl px-4 py-3`}>
-                                                <p className="text-sm">{message.content}</p>
-                                                <p className="text-xs opacity-70 mt-1">
+                                            <div className={`max-w-3xl rounded-2xl px-5 py-4 shadow-sm ${message.type === 'user' ? 'bg-blue-500 text-white' : 'bg-gray-50 text-gray-900 border border-gray-200'}`}>
+                                                {message.type === 'user' ? (
+                                                    <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.content}</p>
+                                                ) : (
+                                                    <div className="text-sm leading-relaxed whitespace-pre-wrap">
+                                                        <ReactMarkdown
+                                                            components={{
+                                                                a: (props) => (
+                                                                    <a {...props} target="_blank" rel="noopener noreferrer" />
+                                                                )
+                                                            }}
+                                                        >
+                                                            {message.content}
+                                                        </ReactMarkdown>
+                                                    </div>
+                                                )}
+                                                <p className="text-xs opacity-70 mt-2">
                                                     {formatTimestamp(message.timestamp)}
                                                 </p>
-                                                
+
                                                 {message.sources && message.sources.length > 0 && (
                                                     <div className="mt-3 pt-3 border-t border-gray-200">
                                                         <p className="text-xs font-semibold mb-2">Sources:</p>

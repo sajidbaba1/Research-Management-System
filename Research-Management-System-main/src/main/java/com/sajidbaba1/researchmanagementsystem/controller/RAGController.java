@@ -6,6 +6,9 @@ import com.sajidbaba1.researchmanagementsystem.repository.ProjectDocumentReposit
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.http.MediaType;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.util.Map;
 import java.util.HashMap;
@@ -32,6 +35,35 @@ public class RAGController {
         } catch (Exception e) {
             return ResponseEntity.internalServerError().build();
         }
+    }
+
+    @GetMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter streamAnswer(
+            @RequestParam String query,
+            @RequestParam Long projectId,
+            @RequestParam(required = false) Long documentId) {
+        SseEmitter emitter = new SseEmitter(0L);
+        new Thread(() -> {
+            try {
+                RAGService.AIResponse ai = ragService.searchAndAnswer(query, projectId, documentId);
+                String answer = ai != null && ai.getAnswer() != null ? ai.getAnswer() : "";
+                // Stream in modest chunks to simulate token streaming
+                int chunkSize = 240;
+                for (int i = 0; i < answer.length(); i += chunkSize) {
+                    int end = Math.min(answer.length(), i + chunkSize);
+                    String chunk = answer.substring(i, end);
+                    emitter.send(SseEmitter.event().data(chunk));
+                }
+                // Send final payload with metadata
+                ObjectMapper mapper = new ObjectMapper();
+                String finalJson = mapper.writeValueAsString(ai);
+                emitter.send(SseEmitter.event().name("done").data(finalJson));
+                emitter.complete();
+            } catch (Exception ex) {
+                try { emitter.completeWithError(ex); } catch (Exception ignore) {}
+            }
+        }).start();
+        return emitter;
     }
 
     @GetMapping("/insights/{projectId}")

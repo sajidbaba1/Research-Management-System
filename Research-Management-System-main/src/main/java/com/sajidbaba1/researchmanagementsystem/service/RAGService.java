@@ -88,6 +88,7 @@ public class RAGService {
         private String answer;
         private List<String> sources;
         private String query;
+        private List<Map<String, Object>> citations;
 
         public AIResponse(String answer, List<String> sources, String query) {
             this.answer = answer;
@@ -101,6 +102,8 @@ public class RAGService {
         public void setSources(List<String> sources) { this.sources = sources; }
         public String getQuery() { return query; }
         public void setQuery(String query) { this.query = query; }
+        public List<Map<String, Object>> getCitations() { return citations; }
+        public void setCitations(List<Map<String, Object>> citations) { this.citations = citations; }
     }
 
     public AIResponse searchAndAnswer(String query, Long projectId) {
@@ -114,13 +117,45 @@ public class RAGService {
 
             // First try semantic search via Pinecone for the selected project namespace
             try {
-                float[] qVec = embedQueryWithGemini(query);
-                float[] q748 = resizeVectors(Collections.singletonList(qVec), 748).get(0);
-                List<Map<String, Object>> matches = queryPinecone(q748, projectId, documentId, 5);
+                // Expand query to improve recall (safe fallback to original if expansion fails)
+                List<String> queries = new ArrayList<>();
+                queries.add(query);
+                try {
+                    List<String> expanded = expandQueryVariants(query);
+                    if (expanded != null) {
+                        for (String qv : expanded) if (qv != null && !qv.isBlank()) queries.add(qv);
+                    }
+                } catch (Exception ignore) {}
+
+                // Recall generously then rerank to top-10
+                List<Map<String, Object>> pool = new ArrayList<>();
+                for (String q : queries) {
+                    float[] qVec = embedQueryWithGemini(q);
+                    float[] q748 = resizeVectors(Collections.singletonList(qVec), 748).get(0);
+                    List<Map<String, Object>> chunks = queryPinecone(q748, projectId, documentId, 50);
+                    if (chunks != null) pool.addAll(chunks);
+                }
+
+                // Deduplicate by id if present
+                Map<String, Map<String, Object>> uniq = new LinkedHashMap<>();
+                for (Map<String, Object> m : pool) {
+                    String id = String.valueOf(m.getOrDefault("id", UUID.randomUUID().toString()));
+                    uniq.putIfAbsent(id, m);
+                }
+                List<Map<String, Object>> matches = new ArrayList<>(uniq.values());
+                if (!matches.isEmpty()) {
+                    try {
+                        matches = rerankWithGemini(query, matches, 10);
+                    } catch (Exception re) {
+                        // If rerank fails, fallback to first 10
+                        if (matches.size() > 10) matches = matches.subList(0, 10);
+                    }
+                }
                 if (matches != null && !matches.isEmpty()) {
                     // Build a concise answer using Gemini 1.5 Flash on the top chunks
                     int k = Math.min(3, matches.size());
                     List<String> topChunks = new ArrayList<>();
+                    List<Map<String, Object>> citations = new ArrayList<>();
                     for (int i = 0; i < k; i++) {
                         Map<String, Object> m = matches.get(i);
                         Map<String, Object> meta = (Map<String, Object>) m.get("metadata");
@@ -130,12 +165,21 @@ public class RAGService {
                         if (chunk.length() > 1200) chunk = chunk.substring(0, 1200);
                         topChunks.add("[" + (i+1) + "] " + fileName + "\n" + chunk);
                         if (!sources.contains(fileName)) sources.add(fileName);
+
+                        Map<String, Object> cite = new HashMap<>();
+                        cite.put("index", i + 1);
+                        cite.put("fileName", fileName);
+                        cite.put("snippet", chunk);
+                        if (meta != null && meta.get("page") != null) cite.put("page", meta.get("page"));
+                        citations.add(cite);
                     }
 
                     try {
                         String nice = generateAnswerFromChunks(query, topChunks);
                         if (nice != null && !nice.isBlank()) {
-                            return new AIResponse(nice, sources, query);
+                            AIResponse ai = new AIResponse(nice, sources, query);
+                            ai.setCitations(citations);
+                            return ai;
                         }
                     } catch (Exception ge) {
                         System.err.println("Gemini synthesis failed: " + ge.getMessage());
@@ -213,10 +257,11 @@ public class RAGService {
         // Build a compact, formatting-oriented prompt
         StringBuilder prompt = new StringBuilder();
         prompt.append("You are a helpful assistant answering questions from provided document excerpts.\n");
-        prompt.append("- Answer the user query concisely.\n");
-        prompt.append("- Use markdown with short headings and bullet points.\n");
-        prompt.append("- Cite sources as [1], [2], etc., matching the chunk indices.\n");
-        prompt.append("- If unsure, say so.\n\n");
+        prompt.append("- Answer in the user's language.\n");
+        prompt.append("- Return SECTIONS exactly in this order: \n");
+        prompt.append("  1) Summary \n  2) Key points (bulleted) \n  3) Steps/Formula (bulleted, if applicable) \n  4) Sources (as [1], [2], etc.)\n");
+        prompt.append("- Use concise markdown with short headings and bullet points.\n");
+        prompt.append("- Every claim must be grounded in the provided chunks; if not answerable, say so.\n\n");
         prompt.append("User question: \n" + query + "\n\n");
         prompt.append("Context chunks:\n");
         for (int i = 0; i < topChunks.size(); i++) {
@@ -262,6 +307,115 @@ public class RAGService {
             }
         }
         return out.toString().trim();
+    }
+
+    // Expand user query with a few variants (synonyms/phrases). Fallback-safe.
+    private List<String> expandQueryVariants(String query) throws Exception {
+        if (geminiApiKey == null || geminiApiKey.isBlank()) return Collections.emptyList();
+        String model = "gemini-1.5-flash";
+        String url = "https://generativelanguage.googleapis.com/v1/models/" + model + ":generateContent?key=" + geminiApiKey;
+
+        String ask = "Generate up to 3 brief alternative phrasings or keyword variants for this query.\n" +
+                "Return them as a numbered list, one per line, no explanations. Query: \n" + query;
+
+        Map<String, Object> part = new HashMap<>();
+        part.put("text", ask);
+        Map<String, Object> content = new HashMap<>();
+        content.put("role", "user");
+        content.put("parts", Collections.singletonList(part));
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("contents", Collections.singletonList(content));
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<Map<String, Object>> entity = new HttpEntity<>(payload, headers);
+        ResponseEntity<Map> resp = restTemplate.postForEntity(url, entity, Map.class);
+        if (!resp.getStatusCode().is2xxSuccessful() || resp.getBody() == null) return Collections.emptyList();
+        Map body = resp.getBody();
+        Object candsObj = body.get("candidates");
+        if (!(candsObj instanceof List)) return Collections.emptyList();
+        List cands = (List) candsObj;
+        if (cands.isEmpty()) return Collections.emptyList();
+        Object first = cands.get(0);
+        if (!(first instanceof Map)) return Collections.emptyList();
+        Map firstMap = (Map) first;
+        Object cObj = firstMap.get("content");
+        if (!(cObj instanceof Map)) return Collections.emptyList();
+        Map cMap = (Map) cObj;
+        Object partsObj = cMap.get("parts");
+        if (!(partsObj instanceof List)) return Collections.emptyList();
+        List partsList = (List) partsObj;
+        StringBuilder out = new StringBuilder();
+        for (Object p : partsList) {
+            if (p instanceof Map) {
+                Object t = ((Map) p).get("text");
+                if (t != null) out.append(t.toString());
+            }
+        }
+        String[] lines = out.toString().split("\n");
+        List<String> variants = new ArrayList<>();
+        for (String line : lines) {
+            String s = line.replaceFirst("^\\s*\\d+\\)\\s*", "").trim();
+            if (!s.isBlank()) variants.add(s);
+        }
+        return variants;
+    }
+
+    // Rerank candidate chunks using Gemini with the original query; return topN
+    private List<Map<String, Object>> rerankWithGemini(String query, List<Map<String, Object>> candidates, int topN) throws Exception {
+        if (candidates == null || candidates.isEmpty()) return candidates;
+        if (geminiApiKey == null || geminiApiKey.isBlank()) return candidates;
+        String model = "gemini-1.5-flash";
+        String url = "https://generativelanguage.googleapis.com/v1/models/" + model + ":generateContent?key=" + geminiApiKey;
+
+        StringBuilder prompt = new StringBuilder();
+        prompt.append("Given the user query, rank the provided chunks by relevance (most to least).\n");
+        prompt.append("Return ONLY a JSON array of indices (0-based) in the new order. No text.\n\n");
+        prompt.append("Query: \n" + query + "\n\n");
+        for (int i = 0; i < Math.min(30, candidates.size()); i++) { // cap prompt length
+            Map<String, Object> meta = (Map<String, Object>) candidates.get(i).get("metadata");
+            String fileName = meta != null && meta.get("fileName") != null ? meta.get("fileName").toString() : "doc";
+            String chunk = meta != null && meta.get("chunk") != null ? meta.get("chunk").toString() : "";
+            if (chunk.length() > 700) chunk = chunk.substring(0, 700);
+            prompt.append("[" + i + "] " + fileName + "\n" + chunk + "\n\n");
+        }
+
+        Map<String, Object> part = new HashMap<>();
+        part.put("text", prompt.toString());
+        Map<String, Object> content = new HashMap<>();
+        content.put("role", "user");
+        content.put("parts", Collections.singletonList(part));
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("contents", Collections.singletonList(content));
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<Map<String, Object>> entity = new HttpEntity<>(payload, headers);
+        ResponseEntity<Map> resp = restTemplate.postForEntity(url, entity, Map.class);
+        if (!resp.getStatusCode().is2xxSuccessful() || resp.getBody() == null) return candidates;
+        Object candsObj = resp.getBody().get("candidates");
+        if (!(candsObj instanceof List) || ((List) candsObj).isEmpty()) return candidates;
+        Object first = ((List) candsObj).get(0);
+        if (!(first instanceof Map)) return candidates;
+        Object partsObj = ((Map) ((Map) first).get("content")).get("parts");
+        if (!(partsObj instanceof List) || ((List) partsObj).isEmpty()) return candidates;
+        StringBuilder out = new StringBuilder();
+        for (Object p : (List) partsObj) {
+            if (p instanceof Map && ((Map) p).get("text") != null) out.append(((Map) p).get("text").toString());
+        }
+        String jsonOrder = out.toString().trim();
+        List<Map<String, Object>> ranked = new ArrayList<>(candidates);
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            List<Integer> order = mapper.readValue(jsonOrder, List.class);
+            List<Map<String, Object>> tmp = new ArrayList<>();
+            for (Integer idx : order) {
+                if (idx != null && idx >= 0 && idx < ranked.size()) tmp.add(ranked.get(idx));
+            }
+            ranked = tmp;
+        } catch (Exception ignore) {}
+        if (topN > 0 && ranked.size() > topN) ranked = ranked.subList(0, topN);
+        return ranked;
     }
 
     public Map<String, Object> getProjectInsights(Long projectId) {

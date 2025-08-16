@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import axios from 'axios';
 
@@ -7,7 +7,9 @@ interface ChatMessage {
     type: 'user' | 'ai';
     content: string;
     timestamp: Date;
-    sources?: SearchResult[];
+    sources?: any;
+    citations?: Citation[];
+    streaming?: boolean;
 }
 
 interface SearchResult {
@@ -15,6 +17,13 @@ interface SearchResult {
     fileName: string;
     relevance: number;
     context: string;
+}
+
+interface Citation {
+    index: number;
+    fileName: string;
+    snippet: string;
+    page?: any;
 }
 
 interface Project {
@@ -34,6 +43,8 @@ const RAGChat: React.FC = () => {
     const [isRecording, setIsRecording] = useState(false);
     const recognitionRef = useRef<any>(null);
     const messagesEndRef = useRef<HTMLDivElement>(null);
+    const [openCite, setOpenCite] = useState<Record<string, number | null>>({});
+    const speakingRef = useRef<SpeechSynthesisUtterance | null>(null);
 
     useEffect(() => {
         fetchProjects();
@@ -61,6 +72,42 @@ const RAGChat: React.FC = () => {
         }
     };
 
+    const updateMessage = useCallback((id: string, patch: Partial<ChatMessage>) => {
+        setMessages(prev => prev.map(m => (m.id === id ? { ...m, ...patch } : m)));
+    }, []);
+
+    const speak = (text: string) => {
+        try {
+            window.speechSynthesis.cancel();
+            const u = new SpeechSynthesisUtterance(text);
+            speakingRef.current = u;
+            window.speechSynthesis.speak(u);
+        } catch {}
+    };
+
+    const stopSpeak = () => {
+        try { window.speechSynthesis.cancel(); speakingRef.current = null; } catch {}
+    };
+
+    const exportMarkdown = (msg: ChatMessage) => {
+        const parts: string[] = [];
+        parts.push(msg.content || '');
+        if (msg.citations && msg.citations.length > 0) {
+            parts.push('\n\n## Sources');
+            msg.citations.forEach(c => {
+                const pageTxt = c.page != null ? ` (p. ${c.page})` : '';
+                parts.push(`- [${c.index}] ${c.fileName}${pageTxt}`);
+            });
+        }
+        const blob = new Blob([parts.join('\n')], { type: 'text/markdown;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `answer-${msg.id}.md`;
+        a.click();
+        URL.revokeObjectURL(url);
+    };
+
     const handleSendMessage = async () => {
         if (!inputMessage.trim() || !selectedProject) return;
 
@@ -76,36 +123,72 @@ const RAGChat: React.FC = () => {
         setIsLoading(true);
         setIsTyping(true);
 
+        // Prepare placeholder AI message for streaming
+        const aiId = (Date.now() + 1).toString();
+        const aiMessage: ChatMessage = { id: aiId, type: 'ai', content: '', timestamp: new Date(), streaming: true };
+        setMessages(prev => [...prev, aiMessage]);
+
+        const streamUrl = `http://localhost:8080/api/rag/stream?query=${encodeURIComponent(userMessage.content)}&projectId=${selectedProject}${selectedDocumentId ? `&documentId=${selectedDocumentId}` : ''}`;
+
+        let usedStream = false;
         try {
-            const response = await axios.post('http://localhost:8080/api/rag/search', null, {
-                params: {
-                    query: inputMessage,
-                    projectId: selectedProject,
-                    documentId: selectedDocumentId || undefined
+            const es = new EventSource(streamUrl);
+            usedStream = true;
+            const append = (delta: string) => {
+                setMessages(prev => prev.map(m => m.id === aiId ? { ...m, content: (m.content || '') + delta } : m));
+            };
+            es.onmessage = (evt) => {
+                if (evt?.data) {
+                    append(evt.data);
                 }
+            };
+            es.addEventListener('done', (evt: MessageEvent) => {
+                try {
+                    const data = JSON.parse(evt.data);
+                    updateMessage(aiId, {
+                        content: data.answer || '',
+                        sources: data.sources || [],
+                        citations: data.citations || [],
+                        streaming: false
+                    });
+                } catch {
+                    updateMessage(aiId, { streaming: false });
+                }
+                setIsLoading(false);
+                setIsTyping(false);
+                es.close();
             });
-
-            const aiMessage: ChatMessage = {
-                id: (Date.now() + 1).toString(),
-                type: 'ai',
-                content: response.data.answer,
-                timestamp: new Date(),
-                sources: response.data.sources
+            es.onerror = () => {
+                es.close();
+                // Fallback to non-streaming
+                void (async () => {
+                    try {
+                        const response = await axios.post('http://localhost:8080/api/rag/search', null, {
+                            params: {
+                                query: userMessage.content,
+                                projectId: selectedProject,
+                                documentId: selectedDocumentId || undefined
+                            }
+                        });
+                        updateMessage(aiId, {
+                            content: response.data.answer,
+                            sources: response.data.sources,
+                            citations: response.data.citations,
+                            streaming: false
+                        });
+                    } catch {
+                        updateMessage(aiId, {
+                            content: 'I apologize, but I encountered an error processing your request. Please try again.',
+                            streaming: false
+                        });
+                    } finally {
+                        setIsLoading(false);
+                        setIsTyping(false);
+                    }
+                })();
             };
-
-            setMessages(prev => [...prev, aiMessage]);
-            
-        } catch (error) {
-            const errorMessage: ChatMessage = {
-                id: (Date.now() + 1).toString(),
-                type: 'ai',
-                content: 'I apologize, but I encountered an error processing your request. Please try again.',
-                timestamp: new Date()
-            };
-            setMessages(prev => [...prev, errorMessage]);
-        } finally {
-            setIsLoading(false);
-            setIsTyping(false);
+        } catch {
+            // If EventSource fails immediately, fallback
         }
     };
 
@@ -162,6 +245,24 @@ const RAGChat: React.FC = () => {
             }
         }
     };
+
+    // Keyboard shortcuts
+    useEffect(() => {
+        const onKey = (e: KeyboardEvent) => {
+            // Ctrl+K focus input
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+                e.preventDefault();
+                const inputs = document.querySelectorAll('input[type="text"]');
+                if (inputs && inputs[inputs.length - 1]) (inputs[inputs.length - 1] as HTMLInputElement).focus();
+            }
+            // Esc to stop mic
+            if (e.key === 'Escape' && isRecording) {
+                toggleRecording();
+            }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, [isRecording]);
 
     const handleIndexDocument = async () => {
         if (!selectedProject || !selectedDocumentId) return;
@@ -295,8 +396,8 @@ const RAGChat: React.FC = () => {
                                                     <div className="text-sm leading-relaxed whitespace-pre-wrap">
                                                         <ReactMarkdown
                                                             components={{
-                                                                a: (props) => (
-                                                                    <a {...props} target="_blank" rel="noopener noreferrer" />
+                                                                a: ({node, ...props}) => (
+                                                                    <a {...props} target="_blank" rel="noopener noreferrer">{props.children}</a>
                                                                 )
                                                             }}
                                                         >
@@ -308,14 +409,55 @@ const RAGChat: React.FC = () => {
                                                     {formatTimestamp(message.timestamp)}
                                                 </p>
 
-                                                {message.sources && message.sources.length > 0 && (
+                                                {(message.citations && message.citations.length > 0) && (
                                                     <div className="mt-3 pt-3 border-t border-gray-200">
-                                                        <p className="text-xs font-semibold mb-2">Sources:</p>
-                                                        {message.sources.map((source, index) => (
-                                                            <div key={index} className="text-xs bg-blue-100 text-blue-800 rounded px-2 py-1 inline-block mr-2 mb-1">
-                                                                {source.fileName}
+                                                        <p className="text-xs font-semibold mb-2">Citations:</p>
+                                                        <div className="flex flex-wrap gap-2">
+                                                            {message.citations!.map((c) => (
+                                                                <button
+                                                                    key={c.index}
+                                                                    onClick={() => setOpenCite(prev => ({...prev, [message.id]: prev[message.id] === c.index ? null : c.index}))}
+                                                                    className={`text-xs rounded px-2 py-1 border ${openCite[message.id] === c.index ? 'bg-blue-600 text-white border-blue-600' : 'bg-blue-50 text-blue-800 border-blue-200'}`}
+                                                                    title={`${c.fileName}${c.page != null ? ` (p. ${c.page})` : ''}`}
+                                                                >
+                                                                    [{c.index}]
+                                                                </button>
+                                                            ))}
+                                                        </div>
+                                                        {openCite[message.id] && (
+                                                            <div className="mt-2 p-3 bg-gray-50 border border-gray-200 rounded">
+                                                                {(() => {
+                                                                    const c = message.citations!.find(x => x.index === openCite[message.id]);
+                                                                    if (!c) return null;
+                                                                    return (
+                                                                        <div>
+                                                                            <p className="text-xs font-semibold mb-1">{c.fileName}{c.page != null ? ` (p. ${c.page})` : ''}</p>
+                                                                            <p className="text-xs whitespace-pre-wrap">{c.snippet}</p>
+                                                                        </div>
+                                                                    );
+                                                                })()}
                                                             </div>
-                                                        ))}
+                                                        )}
+                                                    </div>
+                                                )}
+
+                                                {message.sources && message.sources.length > 0 && (
+                                                    <div className="mt-3">
+                                                        <p className="text-xs font-semibold mb-2">Sources:</p>
+                                                        {(message.sources as any[]).map((s, idx) => {
+                                                            const name = typeof s === 'string' ? s : (s && s.fileName) ? s.fileName : String(s);
+                                                            return (
+                                                                <span key={idx} className="text-xs bg-gray-100 text-gray-800 rounded px-2 py-1 inline-block mr-2 mb-1">{name}</span>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                )}
+
+                                                {message.type === 'ai' && (
+                                                    <div className="mt-3 flex items-center gap-2">
+                                                        <button onClick={() => speak(message.content)} className="text-xs px-2 py-1 border rounded bg-white">Listen</button>
+                                                        <button onClick={stopSpeak} className="text-xs px-2 py-1 border rounded bg-white">Stop</button>
+                                                        <button onClick={() => exportMarkdown(message)} className="text-xs px-2 py-1 border rounded bg-white">Export</button>
                                                     </div>
                                                 )}
                                             </div>

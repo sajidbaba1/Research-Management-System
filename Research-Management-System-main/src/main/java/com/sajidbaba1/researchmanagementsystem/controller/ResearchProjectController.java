@@ -23,7 +23,18 @@ public class ResearchProjectController {
     private ResearchAnalyticsService analyticsService;
 
     @GetMapping
-    public List<ResearchProject> getAll() {
+    public List<ResearchProject> getAll(
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(required = false) String q
+    ) {
+        LocalDate fromDate = null;
+        LocalDate toDate = null;
+        try { if (from != null && !from.isBlank()) fromDate = LocalDate.parse(from); } catch (Exception ignored) {}
+        try { if (to != null && !to.isBlank()) toDate = LocalDate.parse(to); } catch (Exception ignored) {}
+        if (fromDate != null || toDate != null || (q != null && !q.isBlank())) {
+            return service.findFiltered(fromDate, toDate, q);
+        }
         return service.findAll();
     }
 
@@ -55,6 +66,24 @@ public class ResearchProjectController {
             return ResponseEntity.ok(updatedProject);
         }
         return ResponseEntity.notFound().build();
+    }
+
+    public static class ScheduleUpdateRequest {
+        public String startDate; // ISO yyyy-MM-dd
+        public String endDate;   // ISO yyyy-MM-dd
+        public String getStartDate() { return startDate; }
+        public void setStartDate(String startDate) { this.startDate = startDate; }
+        public String getEndDate() { return endDate; }
+        public void setEndDate(String endDate) { this.endDate = endDate; }
+    }
+
+    @PutMapping("/{id}/schedule")
+    public ResponseEntity<ResearchProject> updateSchedule(@PathVariable Long id, @RequestBody ScheduleUpdateRequest req) {
+        LocalDate s = null, e = null;
+        try { if (req.startDate != null && !req.startDate.isBlank()) s = LocalDate.parse(req.startDate); } catch (Exception ignored) {}
+        try { if (req.endDate != null && !req.endDate.isBlank()) e = LocalDate.parse(req.endDate); } catch (Exception ignored) {}
+        Optional<ResearchProject> updated = service.updateSchedule(id, s, e);
+        return updated.map(ResponseEntity::ok).orElseGet(() -> ResponseEntity.notFound().build());
     }
 
     @DeleteMapping("/{id}")

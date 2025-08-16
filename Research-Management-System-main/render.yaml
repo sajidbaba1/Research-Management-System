@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: research-management-backend
+    env: docker
+    autoDeploy: true
+    plan: free
+    healthCheckPath: /api/resources
+    # If your service takes longer to boot due to DB migrations, increase
+    # health check parameters in the Render dashboard as needed.
+    disk:
+      name: app-uploads
+      mountPath: /app/uploads
+      sizeGB: 1
+    envVars:
+      # Database
+      - key: SPRING_DATASOURCE_URL
+        sync: false
+      - key: SPRING_DATASOURCE_USERNAME
+        sync: false
+      - key: SPRING_DATASOURCE_PASSWORD
+        sync: false
+      # Optional: Explicit server port (Render injects $PORT automatically)
+      - key: PORT
+        value: "8080"
+      # App-specific keys (set these in the Render dashboard)
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: PINECONE_INDEX_NAME
+        sync: false
+      - key: PINECONE_HOST
+        sync: false
+      # Override upload path if needed (maps to upload.path)
+      - key: UPLOAD_PATH
+        value: uploads/

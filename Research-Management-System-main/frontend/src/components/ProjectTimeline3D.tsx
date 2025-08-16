@@ -43,6 +43,20 @@ interface Project {
     criticalPath?: number[]; // optional server-provided CP by project ids
 }
 
+// Resource & Utilization types (Phase 1 frontend features)
+interface Resource {
+    id: number;
+    name: string;
+    role?: string;
+    capacityPerDayHours?: number;
+}
+
+interface UtilizationDay {
+    date: string; // ISO yyyy-MM-dd
+    hours: number;
+    capacityHours: number;
+}
+
 const ProjectTimeline3D: React.FC = () => {
     const mountRef = useRef<HTMLDivElement>(null);
     const canvasHostRef = useRef<HTMLDivElement>(null);
@@ -55,6 +69,12 @@ const ProjectTimeline3D: React.FC = () => {
     const [showCritical, setShowCritical] = useState(true);
     const [showMiniMap, setShowMiniMap] = useState(true);
 
+    // Phase 1: resources & utilization
+    const [resources, setResources] = useState<Resource[]>([]);
+    const [selectedResourceId, setSelectedResourceId] = useState<number | null>(null);
+    const [showUtilization, setShowUtilization] = useState(true);
+    const [utilization, setUtilization] = useState<UtilizationDay[]>([]);
+
     const baseUrl = useMemo(() => process.env.REACT_APP_API_URL || 'http://localhost:8080', []);
 
     // derive min/max from projects
@@ -66,6 +86,11 @@ const ProjectTimeline3D: React.FC = () => {
         const max = new Date(Math.max(...de));
         return { globalMinDate: min, globalMaxDate: max };
     }, [projects]);
+
+    // Phase 1: derive utilization range defaults from project range
+    const utilFrom = useMemo(() => dateRange.min ?? (globalMinDate ? globalMinDate.toISOString().slice(0, 10) : null), [dateRange.min, globalMinDate]);
+    const utilTo = useMemo(() => dateRange.max ?? (globalMaxDate ? globalMaxDate.toISOString().slice(0, 10) : null), [dateRange.max, globalMaxDate]);
+    const overAllocatedDays = useMemo(() => utilization.filter(u => u.hours > u.capacityHours).length, [utilization]);
 
     const filtered = useMemo(() => {
         const s = search.trim().toLowerCase();
@@ -104,6 +129,40 @@ const ProjectTimeline3D: React.FC = () => {
         timer = window.setTimeout(run, 250);
         return () => { ignore = true; if (timer) window.clearTimeout(timer); };
     }, [baseUrl, search, dateRange.min, dateRange.max]);
+
+    // Phase 1: load resources list
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            try {
+                const res = await axios.get(`${baseUrl}/api/resources`);
+                if (!cancelled) setResources(res.data || []);
+            } catch (e) {
+                console.warn('Failed to load resources (optional)', e);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [baseUrl]);
+
+    // Phase 1: fetch utilization for visible range and selected resource
+    useEffect(() => {
+        let cancelled = false;
+        const from = utilFrom;
+        const to = utilTo;
+        if (!from || !to) return;
+        (async () => {
+            try {
+                const params: any = { from, to };
+                if (selectedResourceId != null) params.resourceId = selectedResourceId;
+                const res = await axios.get(`${baseUrl}/api/utilization`, { params });
+                if (!cancelled) setUtilization(Array.isArray(res.data) ? res.data : []);
+            } catch (e) {
+                console.warn('Failed to load utilization (optional)', e);
+                if (!cancelled) setUtilization([]);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [baseUrl, utilFrom, utilTo, selectedResourceId]);
 
     useEffect(() => {
         if (!canvasHostRef.current) return;
@@ -496,6 +555,52 @@ const ProjectTimeline3D: React.FC = () => {
         };
         if (showMiniMap) initMiniMap();
 
+        // utilization heatmap overlay (top strip)
+        const utilGroup = new THREE.Group();
+        scene.add(utilGroup);
+        if (showUtilization && utilization && utilization.length > 0) {
+            for (const u of utilization) {
+                const d = new Date(u.date);
+                const t1 = d.getTime();
+                const t2 = t1 + 24 * 60 * 60 * 1000;
+                // only render if within axis range
+                if (t2 < tMin || t1 > tMax) continue;
+                const xs = scale(Math.max(t1, tMin));
+                const xe = scale(Math.min(t2, tMax));
+                const w = Math.max(0.06, Math.abs(xe - xs));
+                const ratio = u.capacityHours > 0 ? (u.hours / u.capacityHours) : 0;
+                const color = ratio <= 0.5 ? 0x22c55e : ratio <= 1.0 ? 0xf59e0b : 0xef4444;
+                const geom = new THREE.BoxGeometry(w, 0.22, 0.02);
+                const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.85 });
+                const quad = new THREE.Mesh(geom, mat);
+                quad.position.set((xs + xe) / 2, 1.2, 0.02);
+                utilGroup.add(quad);
+            }
+        }
+
+        // over-allocation badges on bars
+        if (showUtilization && utilization && utilization.length > 0) {
+            for (const p of filtered) {
+                const ps = new Date(p.startDate).getTime();
+                const pe = new Date(p.endDate).getTime();
+                const over = utilization.some(u => {
+                    const dt = new Date(u.date).getTime();
+                    return dt >= ps && dt <= pe && u.hours > u.capacityHours;
+                });
+                if (over) {
+                    const mesh = idToMesh.get(p.id);
+                    if (mesh) {
+                        const badge = document.createElement('div');
+                        badge.className = 'text-[10px] text-white bg-red-600 px-1.5 py-0.5 rounded shadow';
+                        badge.textContent = '⚠ Over';
+                        const badgeObj = new CSS2DObject(badge);
+                        badgeObj.position.set(mesh.position.x, mesh.position.y + 0.75, 0);
+                        scene.add(badgeObj);
+                    }
+                }
+            }
+        }
+
         // cleanup
         return () => {
             resizeObserver.disconnect();
@@ -521,7 +626,7 @@ const ProjectTimeline3D: React.FC = () => {
                 miniDiv.parentElement.removeChild(miniDiv);
             }
         };
-    }, [filtered, globalMinDate, globalMaxDate, showCritical, showMiniMap]);
+    }, [filtered, globalMinDate, globalMaxDate, showCritical, showMiniMap, showUtilization, utilization]);
 
     const onExport = () => {
         const host = canvasHostRef.current;
@@ -571,8 +676,28 @@ const ProjectTimeline3D: React.FC = () => {
                         max={globalMaxDate ? globalMaxDate.toISOString().slice(0,10) : undefined}
                     />
                 </div>
+                <div className="flex items-center gap-2 text-sm">
+                    <span className="text-gray-600">Resource</span>
+                    <select
+                        className="border rounded px-2 py-1"
+                        value={selectedResourceId ?? ''}
+                        onChange={(e) => setSelectedResourceId(e.target.value ? Number(e.target.value) : null)}
+                    >
+                        <option value="">All</option>
+                        {resources.map(r => (
+                            <option key={r.id} value={r.id}>{r.name}{r.role ? ` (${r.role})` : ''}</option>
+                        ))}
+                    </select>
+                    <label className="inline-flex items-center gap-1">
+                        <input type="checkbox" checked={showUtilization} onChange={(e) => setShowUtilization(e.target.checked)} />
+                        <span className="text-gray-600">Utilization</span>
+                    </label>
+                </div>
                 <button onClick={onExport} className="ml-auto bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-3 py-1 rounded">Export PNG</button>
                 <div className="text-xs text-gray-400 ml-2">Keys: Arrows pan, +/- zoom, F fit, H toggle CP, M mini-map</div>
+                {showUtilization && (
+                    <div className="text-xs text-red-600 ml-2">Over-alloc days: {overAllocatedDays}</div>
+                )}
             </div>
             <div ref={canvasHostRef} className="relative w-full" style={{ height: 520 }}>
                 {loading && (

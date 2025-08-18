@@ -1,6 +1,6 @@
 import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
-import { FileText, Users, Search, Home, BarChart3, Bot, Folder, Clock } from 'lucide-react';
+import { FileText, Users, Search, Home, BarChart3, Bot, Folder, Clock, Award, Trophy } from 'lucide-react';
 
 const Navigation: React.FC = () => {
   const location = useLocation();
@@ -15,6 +15,8 @@ const Navigation: React.FC = () => {
     { name: 'Search', href: '/search', icon: Search, current: location.pathname === '/search' },
     { name: 'Analytics', href: '/analytics', icon: BarChart3, current: location.pathname === '/analytics' },
     { name: 'RAG Chat', href: '/rag', icon: Bot, current: location.pathname === '/rag' },
+    { name: 'Achievements', href: '/achievements', icon: Award, current: location.pathname === '/achievements' },
+    { name: 'Leaderboards', href: '/leaderboards', icon: Trophy, current: location.pathname === '/leaderboards' },
   ];
 
   return (

@@ -1,6 +1,7 @@
 import React from 'react';
 import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import { ThemeProvider } from './contexts/ThemeContext';
+import { GamificationProvider } from './contexts/GamificationContext';
 import Dashboard from './pages/Dashboard';
 import TeamManagement from './pages/TeamManagement';
 import DocumentManagement from './pages/DocumentManagement';
@@ -15,33 +16,41 @@ import Home from './pages/Home';
 import Timeline from './pages/Timeline';
 import Analytics from './pages/Analytics';
 import RAG from './pages/RAG';
+import GamificationHUD from './components/GamificationHUD';
+import GamificationAchievements from './pages/GamificationAchievements';
+import GamificationLeaderboards from './pages/GamificationLeaderboards';
 
 function App() {
   return (
     <ThemeProvider>
-      <Router>
-        <div className="min-h-screen bg-gray-50 dark:bg-slate-900 transition-colors duration-300">
-          <Navigation />
-          <div className="fixed top-4 right-4 z-50">
-            <ThemeToggle />
+      <GamificationProvider>
+        <Router>
+          <div className="min-h-screen bg-gray-50 dark:bg-slate-900 transition-colors duration-300">
+            <Navigation />
+            <div className="fixed top-4 right-4 z-50">
+              <ThemeToggle />
+            </div>
+            <main className="pt-16">
+              <Routes>
+                <Route path="/" element={<Home />} />
+                <Route path="/dashboard" element={<Dashboard />} />
+                <Route path="/team-management" element={<TeamManagement />} />
+                <Route path="/documents" element={<DocumentManagement />} />
+                <Route path="/search" element={<SearchResults />} />
+                <Route path="/projects" element={<Projects />} />
+                <Route path="/project/:id" element={<ProjectDetail />} />
+                <Route path="/timeline" element={<Timeline />} />
+                <Route path="/analytics" element={<Analytics />} />
+                <Route path="/rag" element={<RAG />} />
+                <Route path="/achievements" element={<GamificationAchievements />} />
+                <Route path="/leaderboards" element={<GamificationLeaderboards />} />
+              </Routes>
+            </main>
+            <GamificationHUD />
+            <Chatbot />
           </div>
-          <main className="pt-16">
-            <Routes>
-              <Route path="/" element={<Home />} />
-              <Route path="/dashboard" element={<Dashboard />} />
-              <Route path="/team-management" element={<TeamManagement />} />
-              <Route path="/documents" element={<DocumentManagement />} />
-              <Route path="/search" element={<SearchResults />} />
-              <Route path="/projects" element={<Projects />} />
-              <Route path="/project/:id" element={<ProjectDetail />} />
-              <Route path="/timeline" element={<Timeline />} />
-              <Route path="/analytics" element={<Analytics />} />
-              <Route path="/rag" element={<RAG />} />
-            </Routes>
-          </main>
-          <Chatbot />
-        </div>
-      </Router>
+        </Router>
+      </GamificationProvider>
     </ThemeProvider>
   );
 }

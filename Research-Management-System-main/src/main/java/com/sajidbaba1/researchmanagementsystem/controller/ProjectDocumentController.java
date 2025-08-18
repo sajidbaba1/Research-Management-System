@@ -4,6 +4,7 @@ import com.sajidbaba1.researchmanagementsystem.entity.ProjectDocument;
 import com.sajidbaba1.researchmanagementsystem.entity.ResearchProject;
 import com.sajidbaba1.researchmanagementsystem.service.ProjectDocumentService;
 import com.sajidbaba1.researchmanagementsystem.service.ResearchProjectService;
+import com.sajidbaba1.researchmanagementsystem.service.GamificationService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
@@ -30,6 +31,9 @@ public class ProjectDocumentController {
 
     @Autowired
     private ResearchProjectService researchProjectService;
+
+    @Autowired
+    private GamificationService gamificationService;
 
     @Value("${file.upload-dir:uploads}")
     private String uploadDir;
@@ -98,6 +102,15 @@ public class ProjectDocumentController {
             document.setFileSize(file.getSize());
 
             ProjectDocument savedDocument = projectDocumentService.saveDocument(document);
+
+            // Record gamification event for document upload (if uploadedBy is a valid userId)
+            try {
+                Long uid = null;
+                try { uid = Long.parseLong(uploadedBy); } catch (Exception ignored) {}
+                if (uid != null) {
+                    gamificationService.recordEvent(uid, "DOCUMENT_UPLOADED");
+                }
+            } catch (Exception ignored) {}
             return ResponseEntity.ok(savedDocument);
 
         } catch (IOException e) {

@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Search, Upload, Plus, Download, Eye, Trash2, Edit, FileText, ExternalLink, Calendar, User, Tag } from 'lucide-react';
+import { useGamification } from '../contexts/GamificationContext';
 
 interface Document {
   id: number;
@@ -16,6 +17,7 @@ interface Document {
 }
 
 const DocumentManagement: React.FC = () => {
+  const { refresh } = useGamification();
   const [documents, setDocuments] = useState<Document[]>([]);
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedFilter, setSelectedFilter] = useState('all');
@@ -98,6 +100,8 @@ const DocumentManagement: React.FC = () => {
       setShowUploadModal(false);
       setUploadFile(null);
       setUploadProgress(0);
+      // Refresh gamification HUD (points, level, streaks)
+      try { await refresh(); } catch {}
 
     } catch (error) {
       console.error('Error uploading file:', error);

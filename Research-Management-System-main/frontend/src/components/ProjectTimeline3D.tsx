@@ -30,6 +30,15 @@ interface Milestone {
     status?: string;
 }
 
+// Optional annotations support (pins). Rendered if present in project.
+interface AnnotationPin {
+    id: number;
+    text: string;
+    link?: string; // e.g., doc URL
+    // Optional offset along the bar in [0,1], 0=start, 1=end; defaults to 0.5
+    at?: number;
+}
+
 interface Project {
     id: number;
     title: string;
@@ -41,6 +50,7 @@ interface Project {
     phases?: Phase[];
     milestones?: Milestone[];
     criticalPath?: number[]; // optional server-provided CP by project ids
+    annotations?: AnnotationPin[]; // optional 3D pins
 }
 
 // Resource & Utilization types (Phase 1 frontend features)
@@ -64,10 +74,55 @@ const ProjectTimeline3D: React.FC = () => {
     const [search, setSearch] = useState('');
     const [hoverInfo, setHoverInfo] = useState<{ x: number; y: number; text: string } | null>(null);
     const [selected, setSelected] = useState<{ title: string; description: string; startDate: string; endDate: string } | null>(null);
+    const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
     const [dateRange, setDateRange] = useState<{ min: string | null; max: string | null }>({ min: null, max: null });
     const [loading, setLoading] = useState(false);
     const [showCritical, setShowCritical] = useState(true);
     const [showMiniMap, setShowMiniMap] = useState(true);
+    const [showLasso, setShowLasso] = useState(false);
+
+    // Camera views
+    const [viewName, setViewName] = useState('');
+    const [savedViews, setSavedViews] = useState<{ name: string; pos: [number, number, number]; target: [number, number, number] }[]>(() => {
+        try {
+            const raw = localStorage.getItem('timelineViews');
+            return raw ? JSON.parse(raw) : [];
+        } catch {
+            return [];
+        }
+    });
+    const [activeViewIdx, setActiveViewIdx] = useState<number | ''>('');
+
+    // Playback scrubber [0..1]
+    const [playT, setPlayT] = useState(0);
+    const playTRef = useRef(0);
+    useEffect(() => { playTRef.current = playT; }, [playT]);
+
+    // Playback controls
+    const [isPlaying, setIsPlaying] = useState(false);
+    const [playSpeed, setPlaySpeed] = useState(1); // 0.25x..4x
+    const [followScrubber, setFollowScrubber] = useState(true);
+    const isPlayingRef = useRef(false);
+    const playSpeedRef = useRef(1);
+    const followRef = useRef(true);
+    useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
+    useEffect(() => { playSpeedRef.current = playSpeed; }, [playSpeed]);
+    useEffect(() => { followRef.current = followScrubber; }, [followScrubber]);
+
+    // Recording (WebM) via MediaRecorder on the main canvas
+    const [isRecording, setIsRecording] = useState(false);
+    const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+    const recordedChunksRef = useRef<Blob[]>([]);
+
+    // Accessibility
+    const ariaLiveRef = useRef<HTMLDivElement>(null);
+
+    // Live camera/controls refs for saving/applying views
+    const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+    const controlsRef = useRef<any | null>(null);
+
+    // Dedicated container inside host to hold Three.js-managed DOM (to avoid React insertBefore conflicts)
+    const threeContainerRef = useRef<HTMLDivElement | null>(null);
 
     // Phase 1: resources & utilization
     const [resources, setResources] = useState<Resource[]>([]);
@@ -92,6 +147,10 @@ const ProjectTimeline3D: React.FC = () => {
     const utilTo = useMemo(() => dateRange.max ?? (globalMaxDate ? globalMaxDate.toISOString().slice(0, 10) : null), [dateRange.max, globalMaxDate]);
     const overAllocatedDays = useMemo(() => utilization.filter(u => u.hours > u.capacityHours).length, [utilization]);
 
+    // Analytics UI state
+    const [showAnalytics, setShowAnalytics] = useState(false);
+
+
     const filtered = useMemo(() => {
         const s = search.trim().toLowerCase();
         let list = projects.filter(p => (!s || p.title.toLowerCase().includes(s) || p.description.toLowerCase().includes(s)));
@@ -105,6 +164,107 @@ const ProjectTimeline3D: React.FC = () => {
         }
         return list;
     }, [projects, search, dateRange]);
+
+    // Frontend analytics (no deps) - moved below 'filtered' to avoid TS used-before-declare
+    const analytics = useMemo(() => {
+        if (!filtered.length) {
+            return {
+                projectsCount: 0,
+                avgDurationDays: 0,
+                dependencyEdges: 0,
+                criticalPathNodes: 0,
+                utilizationMean: 0,
+                utilizationPeak: 0,
+                utilizationPeakDate: null as string | null,
+                avgConcurrency: 0,
+                peakConcurrency: 0,
+                severeOverAllocDays: 0,
+                riskScore: 0,
+            };
+        }
+        const day = 24 * 60 * 60 * 1000;
+        const durations = filtered.map(p => (new Date(p.endDate).getTime() - new Date(p.startDate).getTime()) / day);
+        const avgDurationDays = durations.reduce((a, b) => a + b, 0) / durations.length;
+        const filteredIds = new Set(filtered.map(p => p.id));
+        let dependencyEdges = 0;
+        for (const p of filtered) if (p.dependencies) dependencyEdges += p.dependencies.filter(d => filteredIds.has(d.fromId) && filteredIds.has(d.toId)).length;
+        const cpSet = new Set<number>();
+        for (const p of filtered) if (Array.isArray(p.criticalPath)) p.criticalPath.forEach(id => cpSet.add(id));
+        let utilizationMean = 0, utilizationPeak = 0; let utilizationPeakDate: string | null = null;
+        if (utilization && utilization.length) {
+            const ratios = utilization.map(u => (u.capacityHours > 0 ? u.hours / u.capacityHours : 0));
+            utilizationMean = ratios.reduce((a, b) => a + b, 0) / ratios.length;
+            ratios.forEach((r, idx) => { if (r > utilizationPeak) { utilizationPeak = r; utilizationPeakDate = utilization[idx].date; } });
+        }
+        // Concurrency estimate using sampling across the visible timeline range
+        let avgConcurrency = 0, peakConcurrency = 0;
+        if (globalMinDate && globalMaxDate) {
+            const start = globalMinDate.getTime();
+            const end = globalMaxDate.getTime();
+            const samples = 200;
+            let acc = 0;
+            for (let i = 0; i < samples; i++) {
+                const t = start + (i / (samples - 1)) * (end - start);
+                const c = filtered.reduce((cnt, p) => cnt + ((new Date(p.startDate).getTime() <= t && new Date(p.endDate).getTime() >= t) ? 1 : 0), 0);
+                acc += c; if (c > peakConcurrency) peakConcurrency = c;
+            }
+            avgConcurrency = acc / samples;
+        }
+        const severeOverAllocDays = utilization.filter(u => u.capacityHours > 0 && (u.hours / u.capacityHours) > 1.2).length;
+        // Simple heuristic risk score (0..100)
+        const depDensity = filtered.length ? (dependencyEdges / filtered.length) : 0;
+        const cpShare = filtered.length ? (cpSet.size / filtered.length) : 0;
+        const overAllocShare = (utilization.length ? (overAllocatedDays / utilization.length) : 0);
+        const riskScore = Math.max(0, Math.min(100, Math.round(
+            (depDensity * 25) + (cpShare * 25) + (overAllocShare * 40) + (Math.min(1, avgConcurrency / Math.max(1, filtered.length)) * 10)
+        )));
+        return {
+            projectsCount: filtered.length,
+            avgDurationDays,
+            dependencyEdges,
+            criticalPathNodes: cpSet.size,
+            utilizationMean,
+            utilizationPeak,
+            utilizationPeakDate,
+            avgConcurrency,
+            peakConcurrency,
+            severeOverAllocDays,
+            riskScore,
+        };
+    }, [filtered, utilization, globalMinDate, globalMaxDate, overAllocatedDays]);
+
+    // CSV exports - moved below 'filtered' to avoid TS used-before-declare
+    const exportProjectsCSV = () => {
+        const headers = ['id','title','startDate','endDate','durationDays','phases','milestones','dependencies'];
+        const day = 24 * 60 * 60 * 1000;
+        const rows = filtered.map(p => {
+            const dur = (new Date(p.endDate).getTime() - new Date(p.startDate).getTime()) / day;
+            const ph = p.phases?.length ?? 0;
+            const ms = p.milestones?.length ?? 0;
+            const dep = p.dependencies?.length ?? 0;
+            return [p.id, `"${(p.title||'').replaceAll('"','""')}"`, p.startDate, p.endDate, Math.round(dur*100)/100, ph, ms, dep].join(',');
+        });
+        const csv = [headers.join(','), ...rows].join('\n');
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'projects.csv';
+        a.click();
+        URL.revokeObjectURL(a.href);
+    };
+
+    const exportUtilizationCSV = () => {
+        if (!utilization || !utilization.length) return;
+        const headers = ['date','hours','capacityHours','ratio'];
+        const rows = utilization.map(u => [u.date, u.hours, u.capacityHours, (u.capacityHours>0? (u.hours/u.capacityHours).toFixed(3):'0')].join(','));
+        const csv = [headers.join(','), ...rows].join('\n');
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'utilization.csv';
+        a.click();
+        URL.revokeObjectURL(a.href);
+    };
 
     // server-side filtered fetch with debounce
     useEffect(() => {
@@ -167,14 +327,15 @@ const ProjectTimeline3D: React.FC = () => {
     useEffect(() => {
         if (!canvasHostRef.current) return;
         if (!filtered.length) {
-            // clear previous renderers if any
-            while (canvasHostRef.current.firstChild) canvasHostRef.current.removeChild(canvasHostRef.current.firstChild);
+            // Do not mutate host DOM here; cleanup from previous effect handles disposal.
             return;
         }
 
         const host = canvasHostRef.current;
         const width = host.clientWidth;
         const height = host.clientHeight || 520;
+
+        const container = threeContainerRef.current || host; // fallback just in case
 
         const scene = new THREE.Scene();
         scene.background = new THREE.Color(0x0b1220);
@@ -185,14 +346,14 @@ const ProjectTimeline3D: React.FC = () => {
         const renderer = new THREE.WebGLRenderer({ antialias: true });
         renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
         renderer.setSize(width, height);
-        host.appendChild(renderer.domElement);
+        container.appendChild(renderer.domElement);
 
         const labelRenderer = new CSS2DRenderer();
         labelRenderer.setSize(width, height);
         labelRenderer.domElement.style.position = 'absolute';
         labelRenderer.domElement.style.top = '0';
         labelRenderer.domElement.style.pointerEvents = 'none';
-        host.appendChild(labelRenderer.domElement);
+        container.appendChild(labelRenderer.domElement);
 
         // lights
         const ambient = new THREE.AmbientLight(0xffffff, 0.7);
@@ -208,6 +369,23 @@ const ProjectTimeline3D: React.FC = () => {
         controls.minDistance = 5;
         controls.maxDistance = 120;
         controls.maxPolarAngle = Math.PI / 2.1;
+        // expose refs
+        cameraRef.current = camera;
+        controlsRef.current = controls;
+
+        // Camera: apply from URL (?cam=...)
+        try {
+            const url = new URL(window.location.href);
+            const cam = url.searchParams.get('cam');
+            if (cam) {
+                const { pos, target } = JSON.parse(decodeURIComponent(cam));
+                if (Array.isArray(pos) && Array.isArray(target)) {
+                    camera.position.set(pos[0], pos[1], pos[2]);
+                    controls.target.set(target[0], target[1], target[2]);
+                    controls.update();
+                }
+            }
+        } catch {}
 
         // compute scale
         const tMin = globalMinDate ? globalMinDate.getTime() : new Date().getTime();
@@ -265,9 +443,16 @@ const ProjectTimeline3D: React.FC = () => {
         const bars = new THREE.Group();
         scene.add(bars);
 
-        // maps for quick lookups
-        const idToMesh = new Map<number, THREE.Mesh>();
+        // maps and arrays for instances
         const idToSpan = new Map<number, { x1: number; x2: number; y: number; durationMs: number }>();
+        const idToInstanceId = new Map<number, number>();
+        const instanceIdToId: number[] = [];
+        const instCenterX: number[] = [];
+        const instHalfW: number[] = [];
+        const instY: number[] = [];
+        const instDuration: number[] = [];
+        const instVisible: boolean[] = [];
+        const instUserData: { id: number; title: string; description: string; startDate: string; endDate: string }[] = [];
 
         const laneGap = 1.4;
         const barHeight = 0.5;
@@ -275,28 +460,50 @@ const ProjectTimeline3D: React.FC = () => {
 
         const tmpColor = new THREE.Color();
 
+        // single instanced mesh for all bars
+        const barGeom = new THREE.BoxGeometry(1, barHeight, barDepth);
+        const barMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5, metalness: 0.1, vertexColors: true });
+        const count = filtered.length;
+        const barsInstanced = new THREE.InstancedMesh(barGeom, barMat, count);
+        barsInstanced.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        barsInstanced.castShadow = false;
+        barsInstanced.receiveShadow = true;
+        bars.add(barsInstanced);
+
+        const dummy = new THREE.Object3D();
+
         filtered.forEach((p, idx) => {
             const sT = new Date(p.startDate).getTime();
             const eT = new Date(p.endDate).getTime();
             const x1 = scale(sT);
             const x2 = scale(eT);
             const width = Math.max(0.3, Math.abs(x2 - x1));
-            const geom = new THREE.BoxGeometry(width, barHeight, barDepth);
-            const color = tmpColor.setHSL((idx % 12) / 12, 0.6, 0.5).getHex();
-            const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.5, metalness: 0.1 });
-            const mesh = new THREE.Mesh(geom, mat);
-            mesh.position.set((x1 + x2) / 2, -idx * laneGap - 1, 0);
-            mesh.userData = { id: p.id, title: p.title, description: p.description, startDate: p.startDate, endDate: p.endDate };
-            bars.add(mesh);
-            idToMesh.set(p.id, mesh);
-            idToSpan.set(p.id, { x1, x2, y: mesh.position.y, durationMs: Math.max(0, eT - sT) });
+            const centerX = (x1 + x2) / 2;
+            const y = -idx * laneGap - 1;
+            const color = tmpColor.setHSL((idx % 12) / 12, 0.6, 0.5);
 
-            // label
+            dummy.position.set(centerX, y, 0);
+            dummy.scale.set(width, 1, 1);
+            dummy.updateMatrix();
+            barsInstanced.setMatrixAt(idx, dummy.matrix);
+            barsInstanced.setColorAt(idx, color);
+
+            idToSpan.set(p.id, { x1, x2, y, durationMs: Math.max(0, eT - sT) });
+            idToInstanceId.set(p.id, idx);
+            instanceIdToId[idx] = p.id;
+            instCenterX[idx] = centerX;
+            instHalfW[idx] = width / 2;
+            instY[idx] = y;
+            instDuration[idx] = Math.max(0, eT - sT);
+            instVisible[idx] = true;
+            instUserData[idx] = { id: p.id, title: p.title, description: p.description, startDate: p.startDate, endDate: p.endDate };
+
+            // label (DOM) remains as separate CSS2D objects
             const label = document.createElement('div');
             label.className = 'text-xs text-gray-200 bg-black/40 px-1.5 py-0.5 rounded';
             label.textContent = p.title;
             const labelObj = new CSS2DObject(label);
-            labelObj.position.set((x1 + x2) / 2, -idx * laneGap - 0.3, 0);
+            labelObj.position.set(centerX, y - 0.3, 0);
             scene.add(labelObj);
 
             // phases (segmented overlays)
@@ -308,14 +515,14 @@ const ProjectTimeline3D: React.FC = () => {
                     const pGeom = new THREE.BoxGeometry(pw, 0.18, barDepth + 0.02);
                     const pMat = new THREE.MeshStandardMaterial({ color: ph.color ? new THREE.Color(ph.color) : tmpColor.setHSL((idx % 12) / 12, 0.5, 0.65) });
                     const pMesh = new THREE.Mesh(pGeom, pMat);
-                    pMesh.position.set((ps + pe) / 2, mesh.position.y + 0.38, 0.01);
+                    pMesh.position.set((ps + pe) / 2, y + 0.38, 0.01);
                     scene.add(pMesh);
 
                     const plab = document.createElement('div');
                     plab.className = 'text-[10px] text-gray-100 bg-black/50 px-1 rounded';
                     plab.textContent = ph.name;
                     const plabObj = new CSS2DObject(plab);
-                    plabObj.position.set((ps + pe) / 2, mesh.position.y + 0.7, 0);
+                    plabObj.position.set((ps + pe) / 2, y + 0.7, 0);
                     scene.add(plabObj);
                 }
             }
@@ -327,18 +534,70 @@ const ProjectTimeline3D: React.FC = () => {
                     const geo = new THREE.SphereGeometry(0.08, 12, 12);
                     const mat = new THREE.MeshStandardMaterial({ color: m.color ? new THREE.Color(m.color) : 0xffd166, emissive: 0x222222 });
                     const ms = new THREE.Mesh(geo, mat);
-                    ms.position.set(mx, mesh.position.y + 0.45, 0.05);
+                    ms.position.set(mx, y + 0.45, 0.05);
                     scene.add(ms);
 
                     const mLab = document.createElement('div');
                     mLab.className = 'text-[10px] text-yellow-100 bg-yellow-900/70 px-1 rounded shadow';
                     mLab.textContent = m.title;
                     const mObj = new CSS2DObject(mLab);
-                    mObj.position.set(mx, mesh.position.y + 0.95, 0);
+                    mObj.position.set(mx, y + 0.95, 0);
                     scene.add(mObj);
                 }
             }
+
+            // annotation pins (optional)
+            if (p.annotations && p.annotations.length) {
+                for (const a of p.annotations) {
+                    const at = a.at != null ? a.at : 0.5;
+                    const ax = THREE.MathUtils.lerp(x1, x2, THREE.MathUtils.clamp(at, 0, 1));
+                    const pin = new THREE.Mesh(
+                        new THREE.ConeGeometry(0.08, 0.24, 10),
+                        new THREE.MeshStandardMaterial({ color: 0x60a5fa, emissive: 0x112233 })
+                    );
+                    pin.position.set(ax, y + 0.62, 0.08);
+                    pin.userData = { ...pin.userData, annotation: a };
+                    scene.add(pin);
+
+                    const lab = document.createElement('div');
+                    lab.className = 'text-[10px] text-blue-100 bg-blue-900/70 px-1 rounded shadow underline cursor-pointer';
+                    lab.textContent = a.text;
+                    lab.onclick = (ev) => {
+                        ev.stopPropagation();
+                        if (a.link) window.open(a.link, '_blank');
+                    };
+                    const obj = new CSS2DObject(lab);
+                    obj.position.set(ax, y + 1.0, 0);
+                    scene.add(obj);
+                }
+            }
         });
+
+        barsInstanced.instanceMatrix.needsUpdate = true;
+        if ((barsInstanced as any).instanceColor) (barsInstanced as any).instanceColor.needsUpdate = true;
+
+        // soft frustum culling for instances (throttled)
+        const updateCulling = () => {
+            const left = new THREE.Vector3(-1, 0, 0).unproject(camera).x;
+            const right = new THREE.Vector3(1, 0, 0).unproject(camera).x;
+            const minX = Math.min(left, right) - 0.5;
+            const maxX = Math.max(left, right) + 0.5;
+            let changed = false;
+            for (let i = 0; i < count; i++) {
+                const cx = instCenterX[i];
+                const hw = instHalfW[i];
+                const vis = (cx + hw >= minX) && (cx - hw <= maxX);
+                if (vis !== instVisible[i]) {
+                    instVisible[i] = vis;
+                    dummy.position.set(cx, instY[i], 0);
+                    dummy.scale.set(vis ? hw * 2 : 0.0001, 1, 1);
+                    dummy.updateMatrix();
+                    barsInstanced.setMatrixAt(i, dummy.matrix);
+                    changed = true;
+                }
+            }
+            if (changed) barsInstanced.instanceMatrix.needsUpdate = true;
+        };
 
         // helper to compute inverse scale from x to time
         const xToTime = (x: number) => {
@@ -381,10 +640,10 @@ const ProjectTimeline3D: React.FC = () => {
             depGroup.add(cone);
         }
 
-        // raycasting for hover & drag-to-reschedule
+        // raycasting for hover & drag-to-reschedule (adapted for InstancedMesh)
         const raycaster = new THREE.Raycaster();
         const mouse = new THREE.Vector2();
-        let dragging: { id: number; mesh: THREE.Mesh; span: { x1: number; x2: number; y: number; durationMs: number } } | null = null;
+        let dragging: { id: number; instanceId: number; span: { x1: number; x2: number; y: number; durationMs: number } } | null = null;
         const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
         const onMove = (ev: MouseEvent) => {
             const rect = renderer.domElement.getBoundingClientRect();
@@ -399,18 +658,25 @@ const ProjectTimeline3D: React.FC = () => {
                 // keep width constant; move center to pt.x
                 const width = dragging.span.x2 - dragging.span.x1;
                 const newCenterX = pt.x;
-                dragging.mesh.position.x = newCenterX;
+                // update instance transform
+                instCenterX[dragging.instanceId] = newCenterX;
+                dummy.position.set(newCenterX, dragging.span.y, 0);
+                dummy.scale.set(width, 1, 1);
+                dummy.updateMatrix();
+                barsInstanced.setMatrixAt(dragging.instanceId, dummy.matrix);
+                barsInstanced.instanceMatrix.needsUpdate = true;
                 // update hover info live
                 const centerT = xToTime(newCenterX);
                 const startT = centerT - (dragging.span.durationMs / 2);
                 const endT = centerT + (dragging.span.durationMs / 2);
-                setHoverInfo({ x: ev.clientX - rect.left + 12, y: ev.clientY - rect.top + 12, text: `${dragging.mesh.userData.title}\n${new Date(startT).toDateString()} → ${new Date(endT).toDateString()}` });
+                const ud = instUserData[dragging.instanceId];
+                setHoverInfo({ x: ev.clientX - rect.left + 12, y: ev.clientY - rect.top + 12, text: `${ud.title}\n${new Date(startT).toDateString()} → ${new Date(endT).toDateString()}` });
                 return;
             }
-            const intersects = raycaster.intersectObjects(bars.children, false);
-            if (intersects.length > 0) {
-                const i = intersects[0];
-                const d = i.object.userData;
+            const intersects = raycaster.intersectObject(barsInstanced, false);
+            if (intersects.length > 0 && (intersects[0] as any).instanceId != null) {
+                const idx = (intersects[0] as any).instanceId as number;
+                const d = instUserData[idx];
                 setHoverInfo({ x: ev.clientX - rect.left + 12, y: ev.clientY - rect.top + 12, text: `${d.title}\n${new Date(d.startDate).toDateString()} → ${new Date(d.endDate).toDateString()}` });
             } else {
                 setHoverInfo(null);
@@ -422,28 +688,27 @@ const ProjectTimeline3D: React.FC = () => {
             mouse.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
             mouse.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
             raycaster.setFromCamera(mouse, camera);
-            const intersects = raycaster.intersectObjects(bars.children, false);
-            if (intersects.length > 0) {
-                const obj = intersects[0].object as THREE.Mesh;
-                const id = obj.userData.id as number;
+            const intersects = raycaster.intersectObject(barsInstanced, false);
+            if (intersects.length > 0 && (intersects[0] as any).instanceId != null) {
+                const idx = (intersects[0] as any).instanceId as number;
+                const id = instanceIdToId[idx];
                 const span = idToSpan.get(id);
-                if (span) {
-                    dragging = { id, mesh: obj, span: { ...span } };
-                }
+                if (span) dragging = { id, instanceId: idx, span: { ...span } };
             }
         };
         const onUp = async (ev: MouseEvent) => {
             if (!dragging) return;
             // compute final times
-            const centerX = dragging.mesh.position.x;
+            const centerX = instCenterX[dragging.instanceId];
             const centerT = xToTime(centerX);
             const startT = centerT - (dragging.span.durationMs / 2);
             const endT = centerT + (dragging.span.durationMs / 2);
             const newStart = new Date(startT);
             const newEnd = new Date(endT);
             // optimistic UI: update userData
-            dragging.mesh.userData.startDate = newStart.toISOString().slice(0,10);
-            dragging.mesh.userData.endDate = newEnd.toISOString().slice(0,10);
+            const ud = instUserData[dragging.instanceId];
+            ud.startDate = newStart.toISOString().slice(0,10);
+            ud.endDate = newEnd.toISOString().slice(0,10);
             const updateId = dragging.id;
             const prev = idToSpan.get(updateId)!;
             // update span store
@@ -468,10 +733,12 @@ const ProjectTimeline3D: React.FC = () => {
             mouse.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
             mouse.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
             raycaster.setFromCamera(mouse, camera);
-            const intersects = raycaster.intersectObjects(bars.children, false);
-            if (intersects.length > 0) {
-                const d = intersects[0].object.userData as { title: string; description: string; startDate: string; endDate: string };
-                setSelected(d);
+            const intersects = raycaster.intersectObject(barsInstanced, false);
+            if (intersects.length > 0 && (intersects[0] as any).instanceId != null) {
+                const idx = (intersects[0] as any).instanceId as number;
+                const d = instUserData[idx];
+                setSelected({ title: d.title, description: d.description, startDate: d.startDate, endDate: d.endDate });
+                if (ariaLiveRef.current) ariaLiveRef.current.textContent = `Selected ${d.title} from ${d.startDate} to ${d.endDate}`;
             } else {
                 setSelected(null);
             }
@@ -481,12 +748,43 @@ const ProjectTimeline3D: React.FC = () => {
         // mini-map vars (declared before animate to avoid TDZ)
         let miniRenderer: THREE.WebGLRenderer | null = null;
         let miniCamera: THREE.OrthographicCamera | null = null;
+        let scrubLine: THREE.Line | null = null;
+        let cullAcc = 0;
 
         // animation loop
         let raf = 0;
+        let prevTs = performance.now();
         const animate = () => {
             raf = requestAnimationFrame(animate);
+            const nowTs = performance.now();
+            const dt = Math.min(0.1, Math.max(0, (nowTs - prevTs) / 1000)); // clamp dt
+            prevTs = nowTs;
+
+            // advance playback
+            if (isPlayingRef.current) {
+                const baseRate = 0.05; // fraction per second at 1x (~20s per loop)
+                let t = playTRef.current + dt * baseRate * playSpeedRef.current;
+                if (t > 1) t = t - 1; if (t < 0) t = 0;
+                playTRef.current = t;
+                // reflect in state at low frequency to avoid re-render thrash
+                // update every ~100ms
+                if (Math.abs(t - playT) > 0.01) setPlayT(t);
+            }
             controls.update();
+            // frustum culling throttle inside animate loop
+            cullAcc += dt;
+            if (cullAcc > 0.2) { updateCulling(); cullAcc = 0; }
+            // playback scrubber line
+            if (scrubLine) {
+                const t = THREE.MathUtils.lerp(tMin, tMax, THREE.MathUtils.clamp(playTRef.current, 0, 1));
+                const x = scale(t);
+                scrubLine.position.x = x;
+                if (followRef.current) {
+                    const dx = x - controls.target.x;
+                    controls.target.x += dx * 0.12;
+                    camera.position.x += dx * 0.12;
+                }
+            }
             renderer.render(scene, camera);
             labelRenderer.render(scene, camera);
             if (miniRenderer && miniCamera) {
@@ -540,20 +838,40 @@ const ProjectTimeline3D: React.FC = () => {
         miniDiv.style.bottom = '8px';
         miniDiv.style.border = '1px solid rgba(255,255,255,0.2)';
         miniDiv.style.background = 'rgba(0,0,0,0.3)';
-        miniDiv.style.pointerEvents = 'none';
+        miniDiv.style.pointerEvents = 'auto';
         const initMiniMap = () => {
             const w = 200, h = 120;
             miniRenderer = new THREE.WebGLRenderer({ antialias: true });
             miniRenderer.setSize(w, h);
             miniRenderer.setPixelRatio(1);
             miniDiv.appendChild(miniRenderer.domElement);
-            host.appendChild(miniDiv);
+            container.appendChild(miniDiv);
             miniCamera = new THREE.OrthographicCamera(-axisLength/1.5, axisLength/1.5, 12, -12, 0.1, 500);
             miniCamera.position.set(0, 60, 0.0001);
             miniCamera.up.set(0,0,-1);
             miniCamera.lookAt(0,0,0);
+            // click to center main view
+            miniRenderer!.domElement.addEventListener('click', (ev: MouseEvent) => {
+                const rect = miniRenderer!.domElement.getBoundingClientRect();
+                const nx = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+                const ny = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+                const v = new THREE.Vector3(nx, ny, 0).unproject(miniCamera!);
+                controls.target.x = v.x;
+                controls.update();
+            });
         };
         if (showMiniMap) initMiniMap();
+
+        // scrubber visual
+        {
+            const g = new THREE.BufferGeometry().setFromPoints([
+                new THREE.Vector3(0, -6, 0.02),
+                new THREE.Vector3(0, 8, 0.02),
+            ]);
+            const m = new THREE.LineBasicMaterial({ color: 0x22d3ee });
+            scrubLine = new THREE.Line(g, m);
+            scene.add(scrubLine);
+        }
 
         // utilization heatmap overlay (top strip)
         const utilGroup = new THREE.Group();
@@ -588,13 +906,13 @@ const ProjectTimeline3D: React.FC = () => {
                     return dt >= ps && dt <= pe && u.hours > u.capacityHours;
                 });
                 if (over) {
-                    const mesh = idToMesh.get(p.id);
-                    if (mesh) {
+                    const idx = idToInstanceId.get(p.id);
+                    if (idx != null) {
                         const badge = document.createElement('div');
                         badge.className = 'text-[10px] text-white bg-red-600 px-1.5 py-0.5 rounded shadow';
                         badge.textContent = '⚠ Over';
                         const badgeObj = new CSS2DObject(badge);
-                        badgeObj.position.set(mesh.position.x, mesh.position.y + 0.75, 0);
+                        badgeObj.position.set(instCenterX[idx], instY[idx] + 0.75, 0);
                         scene.add(badgeObj);
                     }
                 }
@@ -616,8 +934,12 @@ const ProjectTimeline3D: React.FC = () => {
                 // @ts-ignore
                 if ((obj as THREE.Mesh).material?.dispose) (obj as THREE.Mesh).material.dispose();
             });
-            host.removeChild(renderer.domElement);
-            host.removeChild(labelRenderer.domElement);
+            if (renderer.domElement.parentElement) {
+                renderer.domElement.parentElement.removeChild(renderer.domElement);
+            }
+            if (labelRenderer.domElement.parentElement) {
+                labelRenderer.domElement.parentElement.removeChild(labelRenderer.domElement);
+            }
             if (miniRenderer && miniRenderer.domElement.parentElement) {
                 miniRenderer.dispose();
                 miniRenderer.domElement.parentElement.removeChild(miniRenderer.domElement);
@@ -639,6 +961,109 @@ const ProjectTimeline3D: React.FC = () => {
         a.download = 'timeline.png';
         a.click();
     };
+
+    const startRecording = () => {
+        if (isRecording) return;
+        const host = canvasHostRef.current; if (!host) return;
+        const canvas = host.querySelector('canvas') as HTMLCanvasElement | null; if (!canvas) return;
+        const stream = (canvas as any).captureStream?.(30);
+        if (!stream) return;
+        try {
+            const mr = new MediaRecorder(stream, { mimeType: 'video/webm;codecs=vp9' });
+            recordedChunksRef.current = [];
+            mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) recordedChunksRef.current.push(e.data); };
+            mr.onstop = () => {
+                const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = 'timeline.webm';
+                a.click();
+                URL.revokeObjectURL(a.href);
+            };
+            mediaRecorderRef.current = mr;
+            mr.start();
+            setIsRecording(true);
+        } catch (e) {
+            // silently ignore if unsupported
+        }
+    };
+
+    const stopRecording = () => {
+        if (!isRecording) return;
+        try { mediaRecorderRef.current?.stop(); } catch {}
+        setIsRecording(false);
+    };
+
+    const onSaveView = () => {
+        if (!viewName) return;
+        const cam = cameraRef.current; const ctl = controlsRef.current;
+        if (!cam || !ctl) return;
+        const pos: [number, number, number] = [cam.position.x, cam.position.y, cam.position.z];
+        const target: [number, number, number] = [ctl.target.x, ctl.target.y, ctl.target.z];
+        const next = [...savedViews, { name: viewName, pos, target }];
+        setSavedViews(next);
+        localStorage.setItem('timelineViews', JSON.stringify(next));
+        setViewName('');
+    };
+
+    const onShareView = () => {
+        // Build a share URL using the last saved or default view
+        const v = typeof activeViewIdx === 'number' ? savedViews[activeViewIdx] : savedViews[savedViews.length - 1];
+        const payload = v || { pos: [0,8,22], target: [0,0,0] };
+        const url = new URL(window.location.href);
+        url.searchParams.set('cam', encodeURIComponent(JSON.stringify({ pos: payload.pos, target: payload.target })));
+        navigator.clipboard?.writeText(url.toString());
+    };
+
+    // Apply selected saved view immediately
+    useEffect(() => {
+        if (activeViewIdx === '' || activeViewIdx == null) return;
+        const v = savedViews[activeViewIdx];
+        if (!v) return;
+        const cam = cameraRef.current; const ctl = controlsRef.current;
+        if (!cam || !ctl) return;
+        cam.position.set(v.pos[0], v.pos[1], v.pos[2]);
+        ctl.target.set(v.target[0], v.target[1], v.target[2]);
+        ctl.update();
+    }, [activeViewIdx, savedViews]);
+
+    const onClearSelection = () => {
+        setSelectedIds(new Set());
+        // Materials will be reset on next render effect
+    };
+
+    const onSelectVisible = () => {
+        const set = new Set<number>();
+        filtered.forEach(p => set.add(p.id));
+        setSelectedIds(set);
+        ariaLiveRef.current && (ariaLiveRef.current.textContent = `Selected ${set.size} visible projects`);
+    };
+
+    const onSelectRelated = () => {
+        if (!selectedIds.size) return;
+        const set = new Set<number>(selectedIds);
+        const map = new Map<number, Project>();
+        projects.forEach(p => map.set(p.id, p));
+        selectedIds.forEach(id => {
+            const p = map.get(id);
+            if (p && p.dependencies) {
+                p.dependencies.forEach(d => { set.add(d.fromId); set.add(d.toId); });
+            }
+            // also include reverse links
+            projects.forEach(other => {
+                if (other.dependencies && other.dependencies.some(d => d.toId === id || d.fromId === id)) set.add(other.id);
+            });
+        });
+        setSelectedIds(set);
+        ariaLiveRef.current && (ariaLiveRef.current.textContent = `Selected ${set.size} related projects`);
+    };
+
+    // stop recording on unmount if still active
+    useEffect(() => {
+        return () => {
+            try { if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') mediaRecorderRef.current.stop(); } catch {}
+        };
+    }, []);
 
     return (
         <motion.div
@@ -694,12 +1119,104 @@ const ProjectTimeline3D: React.FC = () => {
                     </label>
                 </div>
                 <button onClick={onExport} className="ml-auto bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-3 py-1 rounded">Export PNG</button>
+                <div className="flex items-center gap-2 text-sm">
+                    <input
+                        type="text"
+                        placeholder="View name"
+                        className="border rounded px-2 py-1"
+                        value={viewName}
+                        onChange={(e) => setViewName(e.target.value)}
+                        style={{ width: 120 }}
+                    />
+                    <button onClick={onSaveView} className="bg-slate-700 hover:bg-slate-800 text-white text-xs px-2 py-1 rounded">Save View</button>
+                    <select
+                        className="border rounded px-2 py-1"
+                        value={activeViewIdx}
+                        onChange={(e) => setActiveViewIdx(e.target.value ? Number(e.target.value) : '')}
+                    >
+                        <option value="">Views</option>
+                        {savedViews.map((v, idx) => (
+                            <option key={idx} value={idx}>{v.name}</option>
+                        ))}
+                    </select>
+                    <button onClick={onShareView} className="bg-sky-600 hover:bg-sky-700 text-white text-xs px-2 py-1 rounded">Share Link</button>
+                </div>
+                <label className="inline-flex items-center gap-1 ml-2">
+                    <input type="checkbox" checked={showLasso} onChange={(e) => setShowLasso(e.target.checked)} />
+                    <span className="text-gray-600 text-sm">Lasso</span>
+                </label>
+                <button onClick={onClearSelection} className="bg-gray-200 hover:bg-gray-300 text-gray-800 text-xs px-2 py-1 rounded">Clear Sel</button>
+                <button onClick={onSelectVisible} className="bg-gray-200 hover:bg-gray-300 text-gray-800 text-xs px-2 py-1 rounded">Select Visible</button>
+                <button onClick={onSelectRelated} className="bg-gray-200 hover:bg-gray-300 text-gray-800 text-xs px-2 py-1 rounded">Select Related</button>
+                <div className="flex items-center gap-2 text-sm">
+                    <button
+                        onClick={() => setIsPlaying(p => !p)}
+                        className={`px-2 py-1 rounded text-xs ${isPlaying ? 'bg-orange-600 hover:bg-orange-700 text-white' : 'bg-emerald-600 hover:bg-emerald-700 text-white'}`}
+                    >
+                        {isPlaying ? 'Pause' : 'Play'}
+                    </button>
+                    <span className="text-gray-600">T</span>
+                    <input type="range" min={0} max={100} value={Math.round(playT*100)} onChange={(e) => setPlayT(Number(e.target.value)/100)} />
+                    <label className="inline-flex items-center gap-1">
+                        <span className="text-gray-600">Speed</span>
+                        <select className="border rounded px-1 py-0.5"
+                                value={playSpeed}
+                                onChange={(e) => setPlaySpeed(Number(e.target.value))}
+                        >
+                            <option value={0.25}>0.25x</option>
+                            <option value={0.5}>0.5x</option>
+                            <option value={1}>1x</option>
+                            <option value={2}>2x</option>
+                            <option value={4}>4x</option>
+                        </select>
+                    </label>
+                    <label className="inline-flex items-center gap-1">
+                        <input type="checkbox" checked={followScrubber} onChange={(e) => setFollowScrubber(e.target.checked)} />
+                        <span className="text-gray-600">Follow</span>
+                    </label>
+                </div>
+                <button onClick={exportProjectsCSV} className="bg-gray-200 hover:bg-gray-300 text-gray-800 text-xs px-2 py-1 rounded">CSV Projects</button>
+                <button onClick={exportUtilizationCSV} disabled={!utilization.length} className="bg-gray-200 hover:bg-gray-300 disabled:opacity-50 text-gray-800 text-xs px-2 py-1 rounded">CSV Util</button>
+                <button onClick={() => (isRecording ? stopRecording() : startRecording())} className={`text-xs px-2 py-1 rounded ${isRecording ? 'bg-red-600 hover:bg-red-700 text-white' : 'bg-gray-200 hover:bg-gray-300 text-gray-800'}`}>{isRecording ? 'Stop Rec' : 'Record'}</button>
+                <button onClick={() => setShowAnalytics(v => !v)} className="bg-purple-600 hover:bg-purple-700 text-white text-xs px-2 py-1 rounded">{showAnalytics ? 'Hide Analytics' : 'Show Analytics'}</button>
                 <div className="text-xs text-gray-400 ml-2">Keys: Arrows pan, +/- zoom, F fit, H toggle CP, M mini-map</div>
                 {showUtilization && (
                     <div className="text-xs text-red-600 ml-2">Over-alloc days: {overAllocatedDays}</div>
                 )}
             </div>
+            {showAnalytics && (
+                <div className="mb-3 border rounded p-3 bg-white/95">
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-3 text-sm text-gray-800">
+                        <div className="p-2 bg-gray-50 rounded">
+                            <div className="text-xs text-gray-500">Projects</div>
+                            <div className="text-lg font-semibold">{analytics.projectsCount}</div>
+                        </div>
+                        <div className="p-2 bg-gray-50 rounded">
+                            <div className="text-xs text-gray-500">Avg Duration (days)</div>
+                            <div className="text-lg font-semibold">{Math.round(analytics.avgDurationDays*10)/10}</div>
+                        </div>
+                        <div className="p-2 bg-gray-50 rounded">
+                            <div className="text-xs text-gray-500">Dependencies (edges)</div>
+                            <div className="text-lg font-semibold">{analytics.dependencyEdges}</div>
+                        </div>
+                        <div className="p-2 bg-gray-50 rounded">
+                            <div className="text-xs text-gray-500">Critical Path Nodes</div>
+                            <div className="text-lg font-semibold">{analytics.criticalPathNodes}</div>
+                        </div>
+                        <div className="p-2 bg-gray-50 rounded">
+                            <div className="text-xs text-gray-500">Utilization Mean</div>
+                            <div className="text-lg font-semibold">{(analytics.utilizationMean*100).toFixed(1)}%</div>
+                        </div>
+                        <div className="p-2 bg-gray-50 rounded">
+                            <div className="text-xs text-gray-500">Utilization Peak</div>
+                            <div className="text-lg font-semibold">{(analytics.utilizationPeak*100).toFixed(1)}% {analytics.utilizationPeakDate ? `on ${analytics.utilizationPeakDate}` : ''}</div>
+                        </div>
+                    </div>
+                </div>
+            )}
             <div ref={canvasHostRef} className="relative w-full" style={{ height: 520 }}>
+                {/* Three.js container to isolate non-React DOM (canvas, label renderer, minimap) */}
+                <div ref={threeContainerRef} className="absolute inset-0 z-0" />
                 {loading && (
                     <div className="absolute inset-0 flex items-center justify-center bg-black/10 text-gray-700 text-sm">Loading…</div>
                 )}
@@ -712,7 +1229,7 @@ const ProjectTimeline3D: React.FC = () => {
                     </div>
                 )}
                 {selected && (
-                    <div className="absolute top-0 right-0 h-full w-80 bg-white/95 backdrop-blur border-l shadow-lg p-4 overflow-y-auto">
+                    <div className="absolute top-0 right-0 h-full w-80 bg-white/95 backdrop-blur border-l shadow-lg p-4 overflow-y-auto z-20">
                         <div className="flex items-start justify-between mb-2">
                             <h3 className="font-semibold text-gray-900">{selected.title}</h3>
                             <button className="text-gray-500 hover:text-gray-700" onClick={() => setSelected(null)}>✕</button>
@@ -725,6 +1242,8 @@ const ProjectTimeline3D: React.FC = () => {
                         </div>
                     </div>
                 )}
+                {/* ARIA live region for accessibility */}
+                <div ref={ariaLiveRef} aria-live="polite" className="sr-only" />
             </div>
             <div className="text-xs text-gray-500 mt-2">Projects: {filtered.length}</div>
         </motion.div>
